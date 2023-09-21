@@ -2395,24 +2395,41 @@ class BottleNeckAdapterTransformerLayer(BaseTransformerLayer):
         )
 
 
-def set_double_shard_weights_config(cfg: TransformerLayer.Config):
-    """Sets `cfg` to shard FFN and attention weights over both data and model axes."""
+def set_double_shard_weights_config(
+    cfg: TransformerLayer.Config,
+    *,
+    batch_axis_names: Union[str, Sequence[str]] = "data",
+    fsdp_axis_names: Union[str, Sequence[str]] = "data",
+    tp_axis_names: Union[str, Sequence[str]] = "model",
+):
+    """Sets `cfg` to shard FFN and attention weights over both fsdp and tp axes.
+
+    TODO(tom_gunter): Replace default batch/fsdp axis names with "fsdp".
+
+    Args:
+        cfg: Transformer layer config to apply sharding spec to.
+        batch_axis_names: Axis name(s) over which we shard the batch dimension of output tensors.
+        fsdp_axis_names: Axis name(s) over which we shard fully-sharded-data-parallel tensors.
+        tp_axis_names: Axis name(s) over which we shard tensor-parallel tensors.
+    """
+    # pytype: disable=attribute-error
     ff_layer = cfg.feed_forward
     # Shard weights.
-    ff_layer.linear1.param_partition_spec = ("data", "model")
-    ff_layer.linear2.param_partition_spec = ("model", "data")
+    ff_layer.linear1.param_partition_spec = (fsdp_axis_names, tp_axis_names)
+    ff_layer.linear2.param_partition_spec = (tp_axis_names, fsdp_axis_names)
     # Encourage the right activation sharding.
-    ff_layer.linear1.output_partition_spec = ("data", None, "model")
-    ff_layer.linear2.output_partition_spec = ("data", None, "model")
+    ff_layer.linear1.output_partition_spec = (batch_axis_names, None, tp_axis_names)
+    ff_layer.linear2.output_partition_spec = (batch_axis_names, None, tp_axis_names)
 
     def set_attn_partition_specs(attn_layer: MultiheadAttention.Config):
         # Shard weights.
-        attn_layer.input_linear.layer.param_partition_spec = ("data", "model", None)
-        attn_layer.output_linear.param_partition_spec = ("data", "model", None)
+        attn_layer.input_linear.layer.param_partition_spec = (fsdp_axis_names, tp_axis_names, None)
+        attn_layer.output_linear.param_partition_spec = (fsdp_axis_names, tp_axis_names, None)
 
     set_attn_partition_specs(cfg.self_attention.attention)
     if cfg.cross_attention is not None:
         set_attn_partition_specs(cfg.cross_attention.attention)
+    # pytype: enable=attribute-error
 
 
 class BaseStackedTransformerLayer(BaseTransformerLayer):
@@ -2700,7 +2717,10 @@ class _TransformerRepeat(Repeat):
 
             ys = {k: v for k, v in layer_outputs._asdict().items() if k != "data"}
             if layer_states is not None:
-                ys["cached_states"] = VDict(layer_states)  # Vectorize over scan axis.
+                # Vectorize over scan axis.
+                ys["cached_states"] = jax.tree_map(
+                    VDict, layer_states, is_leaf=lambda v: isinstance(v, dict)
+                )
             return layer_outputs.data, ys
 
         repeat_outputs: Repeat.Output = self._run(layer_fn, carry=data, xs=cached_states)
@@ -2728,7 +2748,11 @@ class _TransformerRepeat(Repeat):
 
     def init_states(self, *args: Any, **kwargs: Any) -> NestedTensor:
         def layer_fn(_):
-            return VDict(self.layer.init_states(*args, **kwargs))
+            return jax.tree_map(
+                VDict,
+                self.layer.init_states(*args, **kwargs),
+                is_leaf=lambda v: isinstance(v, dict),
+            )
 
         cfg = self.config
         return jax.vmap(layer_fn)(jnp.empty(cfg.num_layers))
@@ -2981,11 +3005,12 @@ def build_remat_spec(
     Returns:
         None (if no rematerialization is needed) or a RematSpec.
     """
-    if stack_cfg.cls is PipelinedTransformerLayer:
+    # TODO(markblee): Switch to using isinstance everywhere.
+    if stack_cfg.klass is PipelinedTransformerLayer:
         return None
-    attention_name = stack_cfg.layer.self_attention.attention.cls.__name__
+    attention_name = stack_cfg.layer.self_attention.attention.klass.__name__
     return RematSpec(
-        prevent_cse=stack_cfg.cls is StackedTransformerLayer,
+        prevent_cse=stack_cfg.klass is StackedTransformerLayer,
         # If we are running inside a jax.lax.scan (Repeated/Pipelined transformers
         # or Repeated Conformers) we can enable common subexpression elimination optimizations.
         policy=config_for_function(jax_remat_policies.save_only_these_names).set(
