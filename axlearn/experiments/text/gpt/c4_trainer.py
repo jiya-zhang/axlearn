@@ -112,4 +112,19 @@ def named_trainer_configs() -> Dict[str, TrainerConfigFn]:
     for evaler in cfg.evalers.values():
         evaler.input.batcher.global_batch_size = 32
     config_map["fuji-7B-single"] = lambda: cfg
+
+    # Make a variant of fuji-test that terminates early and saves checkpoints frequently
+    fuji_test_kwargs = fuji.get_trainer_kwargs('test', vocab_size=vocab_size)
+    config_map["fuji-test-ms3000"] = get_trainer_config_fn(
+            train_input_source=train_input_source.clone(
+                max_sequence_length=fuji_test_kwargs.pop("max_sequence_length", fuji.MAX_SEQUENCE_LENGTH),
+            ),
+            evalers=evaler_config_dict(_eval_input_sources()),
+            max_step=3000,
+            save_every_n_steps=1000,
+            train_batch_size=32,
+            eval_batch_size=32,
+            eval_every_n_steps=2000
+        )
+
     return config_map
