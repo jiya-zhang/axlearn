@@ -246,7 +246,8 @@ class DataflowJob(GCPJob):
             cmd = cfg.command
         else:
             cmd = (
-                "docker run --rm --mount type=bind,src=$HOME/.config/gcloud,dst=/root/.config/gcloud "
+                "docker run --rm "
+                "--mount type=bind,src=$HOME/.config/gcloud,dst=/root/.config/gcloud "
                 "--entrypoint /bin/bash "
                 f"{self._bundler.id(cfg.name)} -c '{cfg.command}'"
             )
