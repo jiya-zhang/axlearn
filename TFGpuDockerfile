@@ -1,0 +1,43 @@
+FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
+
+# Install python and pip
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg curl gcc g++
+
+# Install Google Cloud CLI
+RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - && \
+    echo "deb https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    apt-get update && apt-get install -y google-cloud-sdk && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install git.
+RUN apt-get update && apt-get install -y git
+# Setup.
+RUN mkdir -p /root
+WORKDIR /root
+# Introduce the minimum set of files for install.
+COPY README.md README.md
+COPY pyproject.toml pyproject.toml
+RUN mkdir axlearn && touch axlearn/__init__.py
+# Install dependencies.
+RUN pip install flit
+RUN pip install --upgrade pip
+
+################################################################################
+# Dataflow container spec.                                                     #
+################################################################################
+
+ENV RUN_PYTHON_SDK_IN_DEFAULT_ENVIRONMENT=1
+# avoid "could not build wheels for fairseq" error
+RUN apt-get install -y python3-dev
+RUN pip install .[gcp,dataflow,dev]
+COPY . .
+
+RUN pip check
+
+COPY --from=apache/beam_python3.9_sdk:2.52.0 /opt/apache/beam /opt/apache/beam
+ENTRYPOINT ["/opt/apache/beam/boot"]
