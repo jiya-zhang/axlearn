@@ -45,6 +45,9 @@ from axlearn.common.module import (
 )
 from axlearn.common.utils import NestedTensor, NestedTensorSpec, Tensor, TensorSpec, set_recursively
 
+from orbax.checkpoint.checkpoint_manager import CheckpointManager, CheckpointManagerOptions
+import orbax.checkpoint as ocp
+
 
 class CheckpointValidationType(str, enum.Enum):
     """Represents a type of checkpoint validation.
@@ -589,6 +592,8 @@ class Checkpointer(Module):
         save_policy: InstantiableConfig = config_for_function(every_n_steps_policy)
         # A config that instantiates to a StateStorage.
         storage: StateStorage.Config = TensorStoreStateStorage.default_config()
+        # TODO (maggiejz): add bool to use Orbax checkpoint
+        use_orbax: bool = True
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
@@ -597,6 +602,21 @@ class Checkpointer(Module):
         self._gc_thread = None
         self._within_context = False
         self._save_policy: CheckpointPolicy = cfg.save_policy.instantiate()
+        self._use_orbax = cfg.use_orbax
+        self._checkpoint_manager = None
+        if self._use_orbax:
+            self._checkpoint_manager = CheckpointManager(
+                directory = cfg.dir,
+                #item_names = (),
+                options=CheckpointManagerOptions(
+                    create=True,
+                    save_interval_steps=cfg.save_policy.n,
+                    max_to_keep=cfg.keep_last_n,
+                    enable_async_checkpointing=True
+                )
+            )
+            logging.info(f"Creating checkpoint manager here:{self._checkpoint_manager}")
+        logging.info(f"Printing config:{cfg}")
 
     def __enter__(self):
         if self._within_context:

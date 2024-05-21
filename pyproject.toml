@@ -49,6 +49,7 @@ apple-silicon = [
 
 # Requirements for testing and development.
 dev = [
+    "orbax-checkpoint",
     "black==23.1a1",  # formatting
     "diffusers==0.26.3", # diffuser dependency for golden config updates
     "einops",
@@ -61,7 +62,7 @@ dev = [
     "pylint==2.17.7",
     "pytest",  # test runner
     "pytest-xdist",  # pytest plugin for test parallelism
-    "pytype==2022.4.22",  # type checking
+    "pytype",  # type checking
     "scikit-learn>=1.1.1",  # test-only
     # Fix AttributeError: module 'scipy.linalg' has no attribute 'tril' and related scipy import errors.
     "scipy==1.12.0",
