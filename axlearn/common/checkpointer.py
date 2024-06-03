@@ -673,9 +673,11 @@ class Checkpointer(Module):
         # if using Orbax, use Orbax CheckpointManager to save
         if self._use_orbax:
             logging.info("Using Orbax to save checkpoints")
+            logging.info(f"Type of state?{type(state)}")
             result = self._checkpoint_manager.save(
-                step, args=ocp.args.Composite(items=ocp.args.PyTreeSave(item=state))
+                step, args=ocp.args.StandardSave(item=state)
             )
+            # TODO: on successful checkpoint saving, why is result False?
             logging.info(f"Result? {result}")
         else:
             if not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
