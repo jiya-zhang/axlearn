@@ -615,8 +615,7 @@ class Checkpointer(Module):
                     enable_async_checkpointing=True
                 )
             )
-            logging.info(f"Creating checkpoint manager here:{self._checkpoint_manager}")
-        logging.info(f"Printing config:{cfg}")
+        logging.info(f"Printing config:\n{cfg}\n")
 
     def __enter__(self):
         if self._within_context:
@@ -671,20 +670,28 @@ class Checkpointer(Module):
         self, *, step: int, state: NestedTensor, evaler_summaries: Optional[Dict[str, Any]] = None
     ):
         """Saves `state` at the given `step` according to the configured checkpoint policy."""
-        if not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
-            return
-        if step < 0 or step >= 10**8:
-            raise ValueError(f"Out-of-range: {step}")
-        ckpt_dir = self.ckpt_dir(step)
-        start_time = time.perf_counter()
-        _cleanup_checkpoint(ckpt_dir)
-        self._storage.save_to_dir(
-            step=step, state=state, ckpt_dir=ckpt_dir, on_commit_callback=write_index_file
-        )
-        end_time = time.perf_counter()
-        logging.info(
-            "Saved checkpoint with %s in %s seconds", type(self._storage), end_time - start_time
-        )
+        # if using Orbax, use Orbax CheckpointManager to save
+        if self._use_orbax:
+            logging.info("Using Orbax to save checkpoints")
+            result = self._checkpoint_manager.save(
+                step, args=ocp.args.Composite(items=ocp.args.PyTreeSave(item=state))
+            )
+            logging.info(f"Result? {result}")
+        else:
+            if not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
+                return
+            if step < 0 or step >= 10**8:
+                raise ValueError(f"Out-of-range: {step}")
+            ckpt_dir = self.ckpt_dir(step)
+            start_time = time.perf_counter()
+            _cleanup_checkpoint(ckpt_dir)
+            self._storage.save_to_dir(
+                step=step, state=state, ckpt_dir=ckpt_dir, on_commit_callback=write_index_file
+            )
+            end_time = time.perf_counter()
+            logging.info(
+                "Saved checkpoint with %s in %s seconds", type(self._storage), end_time - start_time
+            )
 
     def run_garbage_collection(self):
         """Runs one round of garbage collection of past checkpoints."""
@@ -761,6 +768,7 @@ class Checkpointer(Module):
             logging.info("Restored state from ckpt at step %s", step)
         except IndexError:
             # No checkpoint path exists. Return with input state.
+            # TODO: try restoring Orbax checkpoints. If not found, return with input state
             logging.info("Could not find any completed checkpoints under %s", cfg.dir)
             restored_state = state
         return step, restored_state
