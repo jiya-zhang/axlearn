@@ -94,6 +94,15 @@ def latest_checkpoint_path(base_dir: str) -> str:
     return sorted(checkpoint_paths(base_dir)).pop()
 
 
+def parse_orbax_latest_checkpoint(base_dir: str):
+    success_ckpt_paths = tf.io.gfile.glob(os.path.join(base_dir, "*", "commit_success.txt"))
+    paths_list = [os.path.dirname(path) for path in success_ckpt_paths]
+    latest_ckpt_path = sorted(paths_list).pop()
+    logging.info(f"Found latest Orbax checkpoint with path: {latest_ckpt_path}")
+    step = latest_ckpt_path.rsplit("/",1)[-1]
+    logging.info(f"Step number: {step}")
+    return step, latest_ckpt_path
+
 def check_state_structure(
     ckpt_structure: List[Tuple[str, Any]],
     target_structure: List[Tuple[str, Any]],
@@ -615,7 +624,6 @@ class Checkpointer(Module):
                     enable_async_checkpointing=True
                 )
             )
-        logging.info(f"Printing config:\n{cfg}\n")
 
     def __enter__(self):
         if self._within_context:
@@ -666,6 +674,15 @@ class Checkpointer(Module):
         cfg = self.config
         return os.path.join(cfg.dir, f"step_{step:08d}")
 
+    def orbax_dir(self, base_dir: str, step: int):
+        # Return the Orbax checkpoint dir if it exists. Otherwise return None.
+        orbax_step_dir = os.path.join(ckpt_dir_base, step)
+        logging.info(f"Orbax dir to check: {orbax_step_dir}")
+        if tf.io.gfile.exists(orbax_step_dir):
+            return orbax_step_dir
+        else:
+            return None
+
     def save(
         self, *, step: int, state: NestedTensor, evaler_summaries: Optional[Dict[str, Any]] = None
     ):
@@ -673,12 +690,11 @@ class Checkpointer(Module):
         # if using Orbax, use Orbax CheckpointManager to save
         if self._use_orbax:
             logging.info("Using Orbax to save checkpoints")
-            logging.info(f"Type of state?{type(state)}")
             result = self._checkpoint_manager.save(
                 step, args=ocp.args.StandardSave(item=state)
             )
             # TODO: on successful checkpoint saving, why is result False?
-            logging.info(f"Result? {result}")
+            # logging.info(f"Result? {result}")
         else:
             if not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
                 return
@@ -736,6 +752,17 @@ class Checkpointer(Module):
         _validate_checkpoint(ckpt_dir)
         return self._storage.restore_from_dir(step=step, state=state, ckpt_dir=ckpt_dir)
 
+    def _validate_and_restore_orbax(self, step: int, state: NestedTensor, ckpt_dir: str):
+        # validate the checkpoint is complete
+        ckpt_commit_success = os.path.join(ckpt_dir,"commit_success.txt")
+        if not tf.io.gfile.exists(ckpt_commit_success):
+            raise ValueError(
+                f"(Orbax) Checkpoint is incomplete -- expected {ckpt_commit_success} to be present."
+            )
+        # restore checkpoint
+        logging.info("Restore Orbax checkpoints here")
+        return state
+
     def restore(
         self,
         *,
@@ -757,11 +784,23 @@ class Checkpointer(Module):
             as restored_checkpoint_state.
         """
         cfg = self.config
+        # TODO: check from the checkpoint path if it's using Orbax or not
+        # TODO: if using Orbax, validate and restore Orbax checkpoints
+        # If not using Orbax, validate and restore AXLearn checkpoints
+        restored_state = state
         if step is not None:
-            # For a specified step, we try to load it.
-            return step, self._validate_and_restore(
-                step=step, state=state, ckpt_dir=self.ckpt_dir(step)
-            )
+            # TODO: this part is built into Orbax. Can simply do mngr.restore(<step>)
+            orbax_ckpt_dir = orbax_dir(base_dir=cfg.dir, step=step)
+            logging.info(f"Specified step number. Attempting to restore checkpoints with Orbax dir: {orbax_ckpt_dir}")
+            if orbax_ckpt_dir is not None:
+                return step, self._validate_and_restore_orbax(
+                    step=step, state=state, ckpt_dir=orbax_ckpt_dir
+                )
+            else:
+                # For a specified step, we try to load it.
+                return step, self._validate_and_restore(
+                    step=step, state=state, ckpt_dir=self.ckpt_dir(step)
+                )
         try:
             # Latest checkpoint path, if it exists, is guaranteed to be complete.
             ckpt_dir = latest_checkpoint_path(cfg.dir)
@@ -769,8 +808,30 @@ class Checkpointer(Module):
             restored_state = self._validate_and_restore(step=step, state=state, ckpt_dir=ckpt_dir)
             logging.info("Restored state from ckpt at step %s", step)
         except IndexError:
-            # No checkpoint path exists. Return with input state.
-            # TODO: try restoring Orbax checkpoints. If not found, return with input state
-            logging.info("Could not find any completed checkpoints under %s", cfg.dir)
-            restored_state = state
+            # Try to restore Orbax checkpoint
+            logging.info("Did not find legacy checkpoint. Trying to restore Orbax checkpoint now...")
+            logging.info(f"State:\n")
+            logging.info(f"{type(state)}\N")
+            logging.info(f"{state}")
+            try:
+                logging.info(f"ORBAX ckpt manager latest step? {self._checkpoint_manager.latest_step()}")
+                restored_state = self._checkpoint_manager.restore(
+                    step=self._checkpoint_manager.latest_step(),
+                    args=ocp.args.StandardRestore(state)
+                )
+                logging.info(f"ORBAX restored checkpoints!!!")
+                """
+                try:
+                    step, orbax_latest_ckpt_dir = parse_orbax_latest_checkpoint(cfg.dir)
+                    logging.info(f"About to restore step {step} checkpoint at path: {orbax_latest_ckpt_dir}")
+                    restored_state = self. _validate_and_restore_orbax(step=step, state=state, ckpt_dir=orbax_latest_ckpt_dir)
+                    logging.info("(Orbax) Restored state from ckpt at step %s", step)
+                except IndexError:
+                    # No checkpoint path exists. Return with input state.
+                    logging.info("Could not find any completed checkpoints under %s", cfg.dir)
+                    restored_state = state
+                """
+            except Exception as e:
+                logging.info(f"ORBAX error: {e}")
+                quit()
         return step, restored_state
