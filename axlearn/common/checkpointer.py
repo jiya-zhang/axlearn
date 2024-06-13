@@ -689,7 +689,7 @@ class Checkpointer(Module):
         """Saves `state` at the given `step` according to the configured checkpoint policy."""
         # if using Orbax, use Orbax CheckpointManager to save
         if self._use_orbax:
-            logging.info("Using Orbax to save checkpoints")
+            #logging.info("Using Orbax to save checkpoints")
             result = self._checkpoint_manager.save(
                 step, args=ocp.args.StandardSave(item=state)
             )
@@ -810,16 +810,15 @@ class Checkpointer(Module):
         except IndexError:
             # Try to restore Orbax checkpoint
             logging.info("Did not find legacy checkpoint. Trying to restore Orbax checkpoint now...")
-            logging.info(f"State:\n")
-            logging.info(f"{type(state)}\N")
-            logging.info(f"{state}")
             try:
-                logging.info(f"ORBAX ckpt manager latest step? {self._checkpoint_manager.latest_step()}")
+                #logging.info(f"ORBAX ckpt manager latest step? {self._checkpoint_manager.latest_step()}")
+                transformed_state = jax.tree.map(transform_tensorspec, state)
                 restored_state = self._checkpoint_manager.restore(
                     step=self._checkpoint_manager.latest_step(),
-                    args=ocp.args.StandardRestore(state)
+                    args=ocp.args.StandardRestore(transformed_state)
                 )
-                logging.info(f"ORBAX restored checkpoints!!!")
+                step = self._checkpoint_manager.latest_step()
+                logging.info(f"Restored Orbax checkpoints")
                 """
                 try:
                     step, orbax_latest_ckpt_dir = parse_orbax_latest_checkpoint(cfg.dir)
@@ -832,6 +831,20 @@ class Checkpointer(Module):
                     restored_state = state
                 """
             except Exception as e:
-                logging.info(f"ORBAX error: {e}")
-                quit()
+                logging.info(f"Caught Exception: {e}")
         return step, restored_state
+
+def transform_tensorspec(element):
+    # eg: {'weight': TensorSpec(shape=[32, 8], dtype=<class 'jax.numpy.float32'>, mesh_axes=PartitionSpec(None, 'model'))}
+    if isinstance(element, TensorSpec):
+        # change it into orbax compatible format
+        new_element = jax.ShapeDtypeStruct(
+            shape = element.shape,
+            dtype = element.dtype,
+            sharding = element.sharding
+        )
+    else:
+        print("Not TensorSpec")
+    #print(f"Old element: {element}")
+    #print(f"New element: {new_element}")
+    return new_element
