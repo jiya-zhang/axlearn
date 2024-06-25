@@ -601,7 +601,7 @@ class Checkpointer(Module):
         save_policy: InstantiableConfig = config_for_function(every_n_steps_policy)
         # A config that instantiates to a StateStorage.
         storage: StateStorage.Config = TensorStoreStateStorage.default_config()
-        # TODO (maggiejz): add bool to use Orbax checkpoint
+        # A boolean value to indicate the use of Orbax checkpoint
         use_orbax: bool = True
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
@@ -642,7 +642,8 @@ class Checkpointer(Module):
         self._within_context = False
 
     def start_gc_thread(self):
-        if self._gc_thread is None and jax.process_index() == 0:
+        # Only use gc_thread when not using Orbax Checkpointing. Orbax provides garbage collection ootb.
+        if not self._use_orbax and self._gc_thread is None and jax.process_index() == 0:
             self._gc_stopping = threading.Event()
             self._gc_thread = threading.Thread(
                 name=f"{self.path()}.gc_loop",
@@ -653,13 +654,18 @@ class Checkpointer(Module):
 
     def stop(self):
         """Stops the checkpointer. Waits for async writes and garbage collection loop to finish."""
-        self.wait_until_finished()
-        logging.info("Waiting for gc_thread to finish")
-        if self._gc_thread is not None:
-            self._gc_stopping.set()
-            self._gc_thread.join()
-            self._gc_thread = None
-            logging.info("gc_thread finished")
+        if self._use_orbax:
+            # logging.info("Waiting for Orbax checkpoint to finish writing")
+            self._checkpoint_manager.wait_until_finished()
+            # logging.info("Orbax checkpoints written successfully. Exiting.")
+        else:
+            self.wait_until_finished()
+            logging.info("Waiting for gc_thread to finish")
+            if self._gc_thread is not None:
+                self._gc_stopping.set()
+                self._gc_thread.join()
+                self._gc_thread = None
+                logging.info("gc_thread finished")
 
     def _gc_loop(self, *, context_stack: List[InvocationContext]):
         cfg = self.config
@@ -818,7 +824,7 @@ class Checkpointer(Module):
                     args=ocp.args.StandardRestore(transformed_state)
                 )
                 step = self._checkpoint_manager.latest_step()
-                logging.info(f"Restored Orbax checkpoints")
+                logging.info("Restored Orbax checkpoints at step %s", step)
                 """
                 try:
                     step, orbax_latest_ckpt_dir = parse_orbax_latest_checkpoint(cfg.dir)
