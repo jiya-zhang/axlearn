@@ -747,6 +747,7 @@ class Checkpointer(Module):
             remaining_dirs,
         )
 
+
     def wait_until_finished(self):
         """Waits for pending asynchronous saves to finish."""
         self._storage.wait_until_finished()
@@ -817,7 +818,6 @@ class Checkpointer(Module):
             # Try to restore Orbax checkpoint
             logging.info("Did not find legacy checkpoint. Trying to restore Orbax checkpoint now...")
             try:
-                #logging.info(f"ORBAX ckpt manager latest step? {self._checkpoint_manager.latest_step()}")
                 transformed_state = jax.tree.map(transform_tensorspec, state)
                 restored_state = self._checkpoint_manager.restore(
                     step=self._checkpoint_manager.latest_step(),
@@ -825,17 +825,6 @@ class Checkpointer(Module):
                 )
                 step = self._checkpoint_manager.latest_step()
                 logging.info("Restored Orbax checkpoints at step %s", step)
-                """
-                try:
-                    step, orbax_latest_ckpt_dir = parse_orbax_latest_checkpoint(cfg.dir)
-                    logging.info(f"About to restore step {step} checkpoint at path: {orbax_latest_ckpt_dir}")
-                    restored_state = self. _validate_and_restore_orbax(step=step, state=state, ckpt_dir=orbax_latest_ckpt_dir)
-                    logging.info("(Orbax) Restored state from ckpt at step %s", step)
-                except IndexError:
-                    # No checkpoint path exists. Return with input state.
-                    logging.info("Could not find any completed checkpoints under %s", cfg.dir)
-                    restored_state = state
-                """
             except Exception as e:
                 logging.info(f"Caught Exception: {e}")
         return step, restored_state
