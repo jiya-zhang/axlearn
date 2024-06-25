@@ -759,17 +759,6 @@ class Checkpointer(Module):
         _validate_checkpoint(ckpt_dir)
         return self._storage.restore_from_dir(step=step, state=state, ckpt_dir=ckpt_dir)
 
-    def _validate_and_restore_orbax(self, step: int, state: NestedTensor, ckpt_dir: str):
-        # validate the checkpoint is complete
-        ckpt_commit_success = os.path.join(ckpt_dir,"commit_success.txt")
-        if not tf.io.gfile.exists(ckpt_commit_success):
-            raise ValueError(
-                f"(Orbax) Checkpoint is incomplete -- expected {ckpt_commit_success} to be present."
-            )
-        # restore checkpoint
-        logging.info("Restore Orbax checkpoints here")
-        return state
-
     def restore(
         self,
         *,
@@ -791,18 +780,25 @@ class Checkpointer(Module):
             as restored_checkpoint_state.
         """
         cfg = self.config
-        # TODO: check from the checkpoint path if it's using Orbax or not
-        # TODO: if using Orbax, validate and restore Orbax checkpoints
-        # If not using Orbax, validate and restore AXLearn checkpoints
         restored_state = state
         if step is not None:
-            # TODO: this part is built into Orbax. Can simply do mngr.restore(<step>)
+            # Check first to see if previous checkpoints are saved with Orbax
             orbax_ckpt_dir = orbax_dir(base_dir=cfg.dir, step=step)
             logging.info(f"Specified step number. Attempting to restore checkpoints with Orbax dir: {orbax_ckpt_dir}")
             if orbax_ckpt_dir is not None:
-                return step, self._validate_and_restore_orbax(
-                    step=step, state=state, ckpt_dir=orbax_ckpt_dir
-                )
+                try:
+                    transformed_state = jax.tree.map(transform_tensorspec, state)
+                    restored_state = self._checkpoint_manager.restore(
+                        step=step,
+                        args=ocp.args.StandardRestore(transformed_state)
+                    )
+                    step = step
+                except Exception as e:
+                    logging.info(f"Encountered the following error when restoring Orbax checkpoint at step {step}: {e}")
+                    step = None
+                    restored_state = state
+                return step, restored_state
+            # If not using Orbax, validate and restore AXLearn checkpoints
             else:
                 # For a specified step, we try to load it.
                 return step, self._validate_and_restore(
