@@ -42,6 +42,8 @@ from axlearn.common.utils import (
     thread_stack_traces,
 )
 
+from ml_goodput_measurement import goodput
+
 
 def _prune_empty(in_tree: NestedTensor) -> NestedTensor:
     """Returns a shallow copy of the input tree with empty subtrees pruned.
@@ -426,6 +428,11 @@ class SpmdTrainer(Module):
                 output = None
                 stop_trace_step = None
 
+                # Create Goodput Recorder object
+                run_name='test'
+                goodput_logger_name = f'goodput_{run_name}'
+                goodput_recorder = goodput.GoodputRecorder(job_name=run_name, logger_name=goodput_logger_name, logging_enabled=(jax.process_index() == 0))
+
                 for input_batch in self._input_iter:
                     logging.log_first_n(
                         logging.INFO, "input_batch=%s", 3, utils.shapes(input_batch)
@@ -436,6 +443,10 @@ class SpmdTrainer(Module):
 
                     self._step = self._step + 1
                     self.vlog(3, "Start step %s", self.step)
+
+                    # Record step start time
+                    goodput_recorder.record_step_start_time(self._step)
+
                     output = self._run_step(
                         utils.host_to_global_device_array(input_batch),
                         force_run_evals=force_run_eval_sets_at_max_step
