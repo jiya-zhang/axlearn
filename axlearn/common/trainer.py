@@ -43,6 +43,7 @@ from axlearn.common.utils import (
 )
 
 from ml_goodput_measurement import goodput
+from axlearn.cloud.gcp import logging_utils
 
 
 def _prune_empty(in_tree: NestedTensor) -> NestedTensor:
@@ -429,9 +430,7 @@ class SpmdTrainer(Module):
                 stop_trace_step = None
 
                 # Create Goodput Recorder object
-                run_name='test'
-                goodput_logger_name = f'goodput_{run_name}'
-                goodput_recorder = goodput.GoodputRecorder(job_name=run_name, logger_name=goodput_logger_name, logging_enabled=(jax.process_index() == 0))
+                goodput_recorder = logging_utils.create_recorder(run_name='test')
 
                 for input_batch in self._input_iter:
                     logging.log_first_n(
