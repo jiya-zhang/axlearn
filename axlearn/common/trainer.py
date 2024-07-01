@@ -429,8 +429,10 @@ class SpmdTrainer(Module):
                 output = None
                 stop_trace_step = None
 
-                # Create Goodput Recorder object
-                goodput_recorder = logging_utils.create_recorder(run_name='test')
+                # Create Goodput Manager
+                run_name = logging_utils.get_run_name(cfg.dir)
+                logging.info(f"Run name: {run_name}")
+                goodput_manager = logging_utils.GoodPutManager(run_name=run_name)
 
                 for input_batch in self._input_iter:
                     logging.log_first_n(
@@ -444,7 +446,7 @@ class SpmdTrainer(Module):
                     self.vlog(3, "Start step %s", self.step)
 
                     # Record step start time
-                    goodput_recorder.record_step_start_time(self._step)
+                    goodput_manager.record_step_start_time(self._step)
 
                     output = self._run_step(
                         utils.host_to_global_device_array(input_batch),
@@ -459,6 +461,8 @@ class SpmdTrainer(Module):
                         average_step_time = (now - start_time) / num_steps
                         self._step_log("Average step time: %s seconds", average_step_time)
                         self.summary_writer(self.step, {"average_step_time": average_step_time})
+                        # write GoodPut statistics to Cloud Monitoring
+                        logging.info(f"Average GoodPut: {goodput_manager.get_goodput()}")
                         num_steps = 0
                         start_time = now
                     if self.step >= cfg.max_step:

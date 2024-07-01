@@ -11,16 +11,16 @@ import jax
 def main(_):
     launch.setup()
 
-    # create Goodput Recorder object
-    goodput_recorder = logging_utils.create_recorder(run_name='test')
+    # create Goodput Manager
+    goodput_manager = logging_utils.GoodPutManager(run_name='20240701-01')
     # record job's overall start time
-    goodput_recorder.record_job_start_time()
+    goodput_manager.record_job_start_time()
 
     trainer_config = launch_trainer.get_trainer_config()
     launch_trainer.run_trainer(trainer_config)
 
     # record job's overall stop time
-    goodput_recorder.record_job_end_time()
+    goodput_manager.record_job_end_time()
 
 
 if __name__ == "__main__":
