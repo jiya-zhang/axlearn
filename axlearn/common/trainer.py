@@ -432,7 +432,8 @@ class SpmdTrainer(Module):
                 # Create Goodput Manager
                 run_name = logging_utils.get_run_name(cfg.dir)
                 logging.info(f"Run name: {run_name}")
-                goodput_manager = logging_utils.GoodPutManager(run_name=run_name)
+                goodput_manager = logging_utils.GoodPutManager(run_name=run_name, project_name='placeholder')
+                goodput_manager.set_up_metric()
 
                 for input_batch in self._input_iter:
                     logging.log_first_n(
@@ -462,7 +463,9 @@ class SpmdTrainer(Module):
                         self._step_log("Average step time: %s seconds", average_step_time)
                         self.summary_writer(self.step, {"average_step_time": average_step_time})
                         # write GoodPut statistics to Cloud Monitoring
-                        logging.info(f"Average GoodPut: {goodput_manager.get_goodput()}")
+                        current_goodput = goodput_manager.get_goodput()
+                        logging.info(f"Average GoodPut: {current_goodput}")
+                        goodput_manager.write_goodput_to_cloud(self.step, current_goodput)
                         num_steps = 0
                         start_time = now
                     if self.step >= cfg.max_step:
