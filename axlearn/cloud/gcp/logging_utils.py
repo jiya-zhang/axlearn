@@ -18,8 +18,10 @@ class GoodPutManager():
     _recorder = None
     _calculator = None
     _run_name = None
-    _metric_name = None
+    _goodput_metric_name = None
+    _steptime_metric_name = None
     _project = None
+    _monitoring_client = None
 
     def __init__(self, run_name, project_name):
         """Returns GoodPut Calculator instance."""
@@ -35,6 +37,7 @@ class GoodPutManager():
             job_name=run_name,
             logger_name=goodput_logger_name
         )
+        self._monitoring_client = monitoring_v3.MetricServiceClient()
 
     def record_step_start_time(self, step):
         self._recorder.record_step_start_time(step)
@@ -48,12 +51,10 @@ class GoodPutManager():
         logging.info(f"Recorded job end time for: {self._run_name}")
 
     def get_goodput(self):
-        return self._calculator.get_job_goodput()
+        return self._calculator.get_job_goodput()[0]
 
     def write_goodput_to_cloud(self, step, goodput):
         """Writes current GoodPut to Cloud Monitoring"""
-        client = monitoring_v3.MetricServiceClient()
-
         seconds_since_epoch_utc = time.time()
         nanos_since_epoch_utc = int(
             (seconds_since_epoch_utc - int(seconds_since_epoch_utc)) * 10**9
@@ -75,7 +76,7 @@ class GoodPutManager():
         series.resource.labels["namespace"] = "namespace"
         series.resource.labels["node_id"] = "node_id"
         series.metric.labels["goodput"] = str(goodput)
-        series.metric.labels["job_name"] = step
+        #series.metric.labels["job_name"] = step
         series.metric.labels["event_time"] = event_time
         series.points = [
             monitoring_v3.types.Point(
@@ -83,25 +84,76 @@ class GoodPutManager():
                 value=monitoring_v3.types.TypedValue(double_value=goodput),
             )
         ]
+        self._monitoring_client.create_time_series(name=f"projects/{self._project}", time_series=[series])
 
-        client.create_time_series(name=self._project, time_series=[series])
 
+    def write_step_time_to_cloud(self, step, average_step_time):
+        """Writes current average step time to Cloud Monitoring"""
+        seconds_since_epoch_utc = time.time()
+        nanos_since_epoch_utc = int(
+            (seconds_since_epoch_utc - int(seconds_since_epoch_utc)) * 10**9
+        )
+        interval = monitoring_v3.types.TimeInterval({
+            "end_time": {
+                "seconds": int(seconds_since_epoch_utc),
+                "nanos": nanos_since_epoch_utc,
+            }
+        })
+        event_time = time.strftime(
+            "%d %b %Y %H:%M:%S UTC", time.gmtime(seconds_since_epoch_utc)
+        )
 
-    def set_up_metric(self):
+        series = monitoring_v3.types.TimeSeries()
+        series.metric.type = "custom.googleapis.com/" + self._steptime_metric_name
+        series.resource.type = "generic_node"
+        series.resource.labels["location"] = "us-central2-b"
+        series.resource.labels["namespace"] = "namespace"
+        series.resource.labels["node_id"] = "node_id"
+        #series.metric.labels["goodput"] = str(goodput)
+        #series.metric.labels["job_name"] = step
+        series.metric.labels["event_time"] = event_time
+        series.points = [
+            monitoring_v3.types.Point(
+                interval=interval,
+                value=monitoring_v3.types.TypedValue(double_value=average_step_time),
+            )
+        ]
+        self._monitoring_client.create_time_series(name=f"projects/{self._project}", time_series=[series])
+
+    def set_up_goodput_metric(self):
         """Create a custom metric for Goodput"""
         if self._run_name is None:
             logging.info("Run name is not specified. Exiting...")
             sys.exit()
-        self._metric_name = f'goodput_metric_{self._run_name}'
+        self._goodput_metric_name = f'goodput_metric_{self._run_name}'
         client = monitoring_v3.MetricServiceClient()
 
         descriptor = metric_pb2.MetricDescriptor()
-        descriptor.type = "custom.googleapis.com/" + self._metric_name
+        descriptor.type = "custom.googleapis.com/" + self._goodput_metric_name
         descriptor.metric_kind = metric_pb2.MetricDescriptor.MetricKind.GAUGE
         descriptor.value_type = metric_pb2.MetricDescriptor.ValueType.DOUBLE
         descriptor.description = "Goodput of the job."
 
         descriptor = client.create_metric_descriptor(
-            name=self._project, metric_descriptor=descriptor
+            name=f"projects/{self._project}", metric_descriptor=descriptor
+        )
+        logging.info(f"Created custom metric: {descriptor.name}.")
+
+    def set_up_steptime_metric(self):
+        """Create a custom metric for Goodput"""
+        if self._run_name is None:
+            logging.info("Run name is not specified. Exiting...")
+            sys.exit()
+        self._steptime_metric_name = f'steptime_metric_{self._run_name}'
+        client = monitoring_v3.MetricServiceClient()
+
+        descriptor = metric_pb2.MetricDescriptor()
+        descriptor.type = "custom.googleapis.com/" + self._steptime_metric_name
+        descriptor.metric_kind = metric_pb2.MetricDescriptor.MetricKind.GAUGE
+        descriptor.value_type = metric_pb2.MetricDescriptor.ValueType.DOUBLE
+        descriptor.description = "Running average step time of the job."
+
+        descriptor = client.create_metric_descriptor(
+            name=f"projects/{self._project}", metric_descriptor=descriptor
         )
         logging.info(f"Created custom metric: {descriptor.name}.")

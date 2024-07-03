@@ -12,7 +12,7 @@ def main(_):
     launch.setup()
 
     # create Goodput Manager
-    goodput_manager = logging_utils.GoodPutManager(run_name='20240701-01')
+    goodput_manager = logging_utils.GoodPutManager(run_name='20240703-03', project_name="project_id")
     # record job's overall start time
     goodput_manager.record_job_start_time()
 
