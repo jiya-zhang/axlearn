@@ -44,6 +44,7 @@ from axlearn.common.utils import (
 
 from ml_goodput_measurement import goodput
 from axlearn.cloud.gcp import logging_utils
+import os
 
 
 def _prune_empty(in_tree: NestedTensor) -> NestedTensor:
@@ -430,9 +431,10 @@ class SpmdTrainer(Module):
                 stop_trace_step = None
 
                 # Create Goodput Manager
-                run_name = logging_utils.get_run_name(cfg.dir)
-                logging.info(f"Run name: {run_name}")
-                goodput_manager = logging_utils.GoodPutManager(run_name=run_name, project_name="project_id")
+                #run_name = logging_utils.get_run_name(cfg.dir)
+                #logging.info(f"Run name: {run_name}")
+                run_name = os.environ['RUN_NAME']
+                goodput_manager = logging_utils.GoodPutManager(run_name=run_name, project_name=os.environ['PROJECT_ID'])
                 #goodput_manager.set_up_goodput_metric()
                 #goodput_manager.set_up_steptime_metric()
 

@@ -7,12 +7,13 @@ from axlearn.common import launch, launch_trainer
 from ml_goodput_measurement import goodput
 from axlearn.cloud.gcp import logging_utils
 import jax
+import os
 
 def main(_):
     launch.setup()
 
     # create Goodput Manager
-    goodput_manager = logging_utils.GoodPutManager(run_name='20240709-00', project_name="project_id")
+    goodput_manager = logging_utils.GoodPutManager(run_name=os.environ['RUN_NAME'], project_name=os.environ['PROJECT_ID'])
     # record job's overall start time
     goodput_manager.record_job_start_time()
 
