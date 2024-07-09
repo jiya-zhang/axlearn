@@ -431,12 +431,8 @@ class SpmdTrainer(Module):
                 stop_trace_step = None
 
                 # Create Goodput Manager
-                #run_name = logging_utils.get_run_name(cfg.dir)
-                #logging.info(f"Run name: {run_name}")
                 run_name = os.environ['RUN_NAME']
                 goodput_manager = logging_utils.GoodPutManager(run_name=run_name, project_name=os.environ['PROJECT_ID'])
-                #goodput_manager.set_up_goodput_metric()
-                #goodput_manager.set_up_steptime_metric()
 
                 for input_batch in self._input_iter:
                     logging.log_first_n(
@@ -467,9 +463,6 @@ class SpmdTrainer(Module):
                         self.summary_writer(self.step, {"average_step_time": average_step_time})
                         # write GoodPut statistics to Cloud Monitoring
                         current_goodput = goodput_manager.get_goodput()
-                        logging.info(f"Average GoodPut: {current_goodput}")
-                        #goodput_manager.write_goodput_to_cloud(self.step, current_goodput)
-                        #goodput_manager.write_step_time_to_cloud(self.step, average_step_time)
                         goodput_manager.write_metrics_to_bq(run_name, cfg.checkpointer.use_orbax, self.step, average_step_time, current_goodput)
                         num_steps = 0
                         start_time = now
