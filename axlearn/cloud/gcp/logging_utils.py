@@ -39,18 +39,28 @@ class GoodPutManager():
         self._bigquery_table = self._bigquery_client.get_table(project_name + '.axlearn.orbax_testing_results')
 
     def record_step_start_time(self, step):
-        self._recorder.record_step_start_time(step)
+        if jax.process_index() == 0:
+            self._recorder.record_step_start_time(step)
 
     def record_job_start_time(self):
-        self._recorder.record_job_start_time()
-        logging.info(f"Recorded job start time for: {self._run_name}")
+        if jax.process_index() == 0:
+            self._recorder.record_job_start_time()
+            logging.info(f"Recorded job start time for: {self._run_name}")
+        else:
+            logging.info("Process index non zero. Did not record job start time.")
 
     def record_job_end_time(self):
-        self._recorder.record_job_end_time()
-        logging.info(f"Recorded job end time for: {self._run_name}")
+        if jax.process_index() == 0:
+            self._recorder.record_job_end_time()
+            logging.info(f"Recorded job end time for: {self._run_name}")
+        else:
+            logging.info("Process index non zero. Did not record job end time.")
 
     def get_goodput(self):
-        return self._calculator.get_job_goodput()[0]
+        if jax.process_index() == 0:
+            return self._calculator.get_job_goodput()[0]
+        else:
+            return None
 
     def write_metrics_to_bq(self, run_name, use_orbax, step, step_time, goodput):
         row_data = {

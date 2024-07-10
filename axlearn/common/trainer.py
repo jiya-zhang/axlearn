@@ -445,7 +445,7 @@ class SpmdTrainer(Module):
                     self._step = self._step + 1
                     self.vlog(3, "Start step %s", self.step)
 
-                    # Record step start time
+                    # Record step start time (only on the primary host)
                     goodput_manager.record_step_start_time(self._step)
 
                     output = self._run_step(
@@ -461,9 +461,10 @@ class SpmdTrainer(Module):
                         average_step_time = (now - start_time) / num_steps
                         self._step_log("Average step time: %s seconds", average_step_time)
                         self.summary_writer(self.step, {"average_step_time": average_step_time})
-                        # write GoodPut statistics to Cloud Monitoring
+                        # write GoodPut and Step Time to Cloud
                         current_goodput = goodput_manager.get_goodput()
-                        goodput_manager.write_metrics_to_bq(run_name, cfg.checkpointer.use_orbax, self.step, average_step_time, current_goodput)
+                        if current_goodput is not None:
+                            goodput_manager.write_metrics_to_bq(run_name, cfg.checkpointer.use_orbax, self.step, average_step_time, current_goodput)
                         num_steps = 0
                         start_time = now
                     if self.step >= cfg.max_step:
