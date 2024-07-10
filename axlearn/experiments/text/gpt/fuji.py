@@ -118,8 +118,11 @@ def get_trainer_kwargs(model_size: str, *, vocab_size: int, version: Version) ->
             ),
             learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
-            max_step=max_step,
+            max_step=500000,
+            train_batch_size=32,
+            eval_batch_size=32,
+            save_every_n_steps=500,
+            eval_every_n_steps=1000,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
             mesh_rules=(
                 # Step time:
