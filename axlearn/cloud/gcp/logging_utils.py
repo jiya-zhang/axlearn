@@ -74,3 +74,16 @@ class GoodPutManager():
             table = self._bigquery_table,
             rows = [row_data]
         )
+
+    def write_restore_time_to_bq(self, use_orbax, step, restore_time):
+        run_name = os.environ['RUN_NAME']
+        row_data = {
+            'run_name': run_name,
+            'use_orbax': use_orbax,
+            'step': step,
+            'restore_time': restore_time
+        }
+        self._bigquery_client.insert_rows(
+            table = self._bigquery_table,
+            rows = [row_data]
+        )

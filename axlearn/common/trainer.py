@@ -694,18 +694,25 @@ class SpmdTrainer(Module):
             restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
+                start_time = time.perf_counter()
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
                         ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
                     ),
                 )
+                end_time = time.perf_counter()
                 if step is not None:
                     self.vlog(
                         0,
                         "Restored checkpoint at %s with restore_input_iter=%s",
                         step,
                         restore_input_iter,
+                    )
+                    logging_utils.write_restore_time_to_bq(
+                        use_orbax = self.config.checkpointer.use_orbax,
+                        step = step,
+                        restore_time = end_time - start_time
                     )
             except ValueError as e:
                 logging.warning(
