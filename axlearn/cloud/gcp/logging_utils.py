@@ -39,6 +39,7 @@ class GoodPutManager():
     _run_name = None
     _bigquery_client = None
     _bigquery_table = None
+    _job_started = False
 
     def __init__(self, run_name, project_name):
         """Returns GoodPut Calculator instance."""
@@ -62,18 +63,19 @@ class GoodPutManager():
 
     def record_job_start_time(self):
         # TODO(maggiejz): record only if job start time doesn't exist already
+        if self._job_started:
+            return
         if jax.process_index() == 0:
             self._recorder.record_job_start_time()
             logging.info(f"Recorded job start time for: {self._run_name}")
-        else:
-            logging.info("Process index non zero. Did not record job start time.")
+            self._job_started = True
+
 
     def record_job_end_time(self):
         if jax.process_index() == 0:
             self._recorder.record_job_end_time()
             logging.info(f"Recorded job end time for: {self._run_name}")
-        else:
-            logging.info("Process index non zero. Did not record job end time.")
+
 
     def get_goodput(self):
         if jax.process_index() == 0:
