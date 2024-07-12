@@ -15,6 +15,24 @@ import jax
 def get_run_name(dir):
     return dir.split("/")[-3]
 
+def write_restore_time_to_bq(use_orbax, step, restore_time):
+    # TODO: consider only writing restore time if jax.process_index()==0
+    # Currently this will likely record one restore time per worker
+    project_id = os.environ['PROJECT_ID']
+    run_name = os.environ['RUN_NAME']
+    client = bigquery.Client()
+    bigquery_table = client.get_table(project_id + '.axlearn.orbax_testing_results')
+    row_data = {
+        'run_name': run_name,
+        'use_orbax': use_orbax,
+        'step': step,
+        'restore_time': restore_time
+    }
+    client.insert_rows(
+        table = bigquery_table,
+        rows = [row_data]
+    )
+
 class GoodPutManager():
     _recorder = None
     _calculator = None
@@ -43,6 +61,7 @@ class GoodPutManager():
             self._recorder.record_step_start_time(step)
 
     def record_job_start_time(self):
+        # TODO(maggiejz): record only if job start time doesn't exist already
         if jax.process_index() == 0:
             self._recorder.record_job_start_time()
             logging.info(f"Recorded job start time for: {self._run_name}")
@@ -69,19 +88,6 @@ class GoodPutManager():
             'step': step,
             'running_avg_step_time': step_time,
             'running_goodput': goodput
-        }
-        self._bigquery_client.insert_rows(
-            table = self._bigquery_table,
-            rows = [row_data]
-        )
-
-    def write_restore_time_to_bq(self, use_orbax, step, restore_time):
-        run_name = os.environ['RUN_NAME']
-        row_data = {
-            'run_name': run_name,
-            'use_orbax': use_orbax,
-            'step': step,
-            'restore_time': restore_time
         }
         self._bigquery_client.insert_rows(
             table = self._bigquery_table,
