@@ -47,6 +47,7 @@ from axlearn.common.utils import NestedTensor, NestedTensorSpec, Tensor, TensorS
 
 from orbax.checkpoint.checkpoint_manager import CheckpointManager, CheckpointManagerOptions
 import orbax.checkpoint as ocp
+from axlearn.cloud.gcp import logging_utils
 
 
 class CheckpointValidationType(str, enum.Enum):
@@ -806,20 +807,26 @@ class Checkpointer(Module):
                 )
         try:
             # Latest checkpoint path, if it exists, is guaranteed to be complete.
+            start_time = time.perf_counter()
             ckpt_dir = latest_checkpoint_path(cfg.dir)
             step = parse_step_from_dir(ckpt_dir)
             restored_state = self._validate_and_restore(step=step, state=state, ckpt_dir=ckpt_dir)
+            end_time = time.perf_counter()
+            logging_utils.write_restore_time_to_bq(False, step, end_time - start_time)
             logging.info("Restored state from ckpt at step %s", step)
         except IndexError:
             # Try to restore Orbax checkpoint
             logging.info("Did not find legacy checkpoint. Trying to restore Orbax checkpoint now...")
             try:
+                start_time = time.perf_counter()
                 transformed_state = jax.tree.map(transform_tensorspec, state)
                 restored_state = self._checkpoint_manager.restore(
                     step=self._checkpoint_manager.latest_step(),
                     args=ocp.args.StandardRestore(transformed_state)
                 )
                 step = self._checkpoint_manager.latest_step()
+                end_time = time.perf_counter()
+                logging_utils.write_restore_time_to_bq(True, step, end_time - start_time)
                 logging.info("Restored Orbax checkpoints at step %s", step)
             except Exception as e:
                 logging.info(f"Caught Exception: {e}")
