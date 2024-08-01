@@ -42,6 +42,10 @@ from axlearn.common.utils import (
     thread_stack_traces,
 )
 
+from ml_goodput_measurement import goodput
+from axlearn.cloud.gcp import logging_utils
+import os
+
 
 def _prune_empty(in_tree: NestedTensor) -> NestedTensor:
     """Returns a shallow copy of the input tree with empty subtrees pruned.
@@ -426,6 +430,10 @@ class SpmdTrainer(Module):
                 output = None
                 stop_trace_step = None
 
+                # Create Goodput Manager
+                run_name = os.environ['RUN_NAME']
+                goodput_manager = logging_utils.GoodPutManager(run_name=run_name, project_name=os.environ['PROJECT_ID'])
+
                 for input_batch in self._input_iter:
                     logging.log_first_n(
                         logging.INFO, "input_batch=%s", 3, utils.shapes(input_batch)
@@ -436,6 +444,10 @@ class SpmdTrainer(Module):
 
                     self._step = self._step + 1
                     self.vlog(3, "Start step %s", self.step)
+
+                    # Record step start time (only on the primary host)
+                    goodput_manager.record_step_start_time(self._step)
+
                     output = self._run_step(
                         utils.host_to_global_device_array(input_batch),
                         force_run_evals=force_run_eval_sets_at_max_step
@@ -449,6 +461,10 @@ class SpmdTrainer(Module):
                         average_step_time = (now - start_time) / num_steps
                         self._step_log("Average step time: %s seconds", average_step_time)
                         self.summary_writer(self.step, {"average_step_time": average_step_time})
+                        # write GoodPut and Step Time to Cloud
+                        current_goodput = goodput_manager.get_goodput()
+                        if current_goodput is not None:
+                            goodput_manager.write_metrics_to_bq(run_name, cfg.checkpointer.use_orbax, self.step, average_step_time, current_goodput)
                         num_steps = 0
                         start_time = now
                     if self.step >= cfg.max_step:
