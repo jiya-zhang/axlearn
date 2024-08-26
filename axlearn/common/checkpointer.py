@@ -1187,3 +1187,226 @@ class OrbaxCheckpointer(BaseCheckpointer):
         ocp.args.register_with_handler(Wrapper, for_save=True, for_restore=True)(WrapperArgs)
 
         return Wrapper, WrapperArgs
+
+
+class OrbaxEmergencyCheckpointer(BaseCheckpointer):
+    """A checkpointer that uses orbax Emergency CheckpointManager.
+    Note: This checkpointer is experimental and may not support all functionalities
+    provided by orbax CheckpointManager.
+    """
+    # Disable lazy imports within the class, to avoid requiring orbax dependency globally.
+    # pylint: disable=import-outside-toplevel
+
+    @config_class
+    class Config(BaseCheckpointer.Config):
+        """Configures OrbaxCheckpointer.
+
+        Attributes:
+            keep_last_n: Keep this many past ckpts.
+            validation_type: Checkpoint validation during restore.
+            save_concurrent_gb: Max concurrent GB during save. Defaults to 96 (orbax default).
+            restore_concurrent_gb: Max concurrent GB during write. Defaults to 96 (orbax default).
+            local_checkpoint_dir: Directory to store local checkpoints.
+            local_save_interval_steps: Save every n steps for local checkpoints.
+            persistent_save_interval_steps: Save every n steps for persistent checkpoints.
+        """
+
+        keep_last_n: int = 1
+        validation_type: CheckpointValidationType = CheckpointValidationType.EXACT
+        save_concurrent_gb: int = 96
+        restore_concurrent_gb: int = 96
+        local_checkpoint_dir: Optional[str] = "/cache"
+        local_save_interval_steps: Optional[int] = 50
+        persistent_save_interval_steps: Optional[int] = 5000
+
+    @classmethod
+    def checkpoint_paths(cls, base_dir: str) -> List[str]:
+        """See `BaseCheckpointer.checkpointer_paths`."""
+        import orbax.checkpoint as ocp
+
+        return [str(path) for path in ocp.utils.checkpoint_steps_paths(base_dir)]
+
+    def __init__(self, cfg: Config, *, parent: Optional[Module]):
+        super().__init__(cfg, parent=parent)
+        import orbax.checkpoint as ocp
+        import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
+
+        cfg: OrbaxCheckpointer.Config = self.config
+        save_policy = cfg.save_policy.instantiate()
+
+        # Orbax only provides (current_step, last_saved_step) as args to the save policy, so we use
+        # a closure to capture evaler summaries. While the policy can be applied outside of orbax to
+        # decide whether or not to invoke `save()` at a given step, some features like
+        # save-on-preemption assume that `save()` is invoked every step.
+        #
+        # The semaphore will be acquired when we save, and released when we invoke the policy.
+        self._eval_summaries_sem = threading.Semaphore()
+        self._eval_summaries = {}
+
+        def save_fn_with_summaries(step: int, last_saved_step: Optional[int]) -> bool:
+            del last_saved_step
+            try:
+                verdict = save_policy(step=step, evaler_summaries=self._eval_summaries)
+            finally:
+                self._eval_summaries.clear()
+                self._eval_summaries_sem.release()
+            return verdict
+
+        PyTreeCheckpointHandler = ocp.pytree_checkpoint_handler.PyTreeCheckpointHandler
+        LocalCheckpointOptions = emergency_checkpoint_manager.LocalCheckpointOptions
+        PersistentCheckpointOptions = (
+            emergency_checkpoint_manager.PersistentCheckpointOptions
+        )
+
+        local_checkpoint_handler = PyTreeCheckpointHandler(
+            use_ocdbt=True,
+            use_zarr3=True,
+            primary_host=None,
+            type_handler_registry=local_registry,
+        )
+
+        # Set the Checkpoint Manager options as relevant to local checkpointer
+        # See: https://github.com/google/orbax/blob/main/checkpoint/orbax/checkpoint/experimental/emergency/checkpoint_manager.py#L206
+        options = emergency_checkpoint_manager.CheckpointManagerOptions(
+            local=LocalCheckpointOptions(
+                save_interval_steps=cfg.local_save_interval_steps
+            ),
+            persistent=PersistentCheckpointOptions(
+                save_interval_steps=cfg.persistent_save_interval_steps
+            ),
+        )
+
+        # TODO: figure out global_mesh and abstract_state
+        self._manager = emergency_checkpoint_manager.CheckpointManager(
+            local_directory=cfg.local_checkpoint_dir,
+            persistent_directory=cfg.dir,
+            global_mesh=global_mesh,
+            abstract_state=abstract_state,
+            options=options,
+            local_state_handler=local_checkpoint_handler(),
+        )
+
+    def _get_spec(self, *, step: int, state: NestedTensor) -> Nested[Any]:
+        spec = {"index": [("step", step)], "tf_ckpt_map": {}}
+        for path, value in utils.flatten_items(state):
+            if isinstance(value, (Tensor, TensorSpec)):
+                dtype = getattr(value.dtype, "dtype", value.dtype)
+                spec["index"].append(
+                    (path, {"dtype": str(dtype), "shape": str(tuple(value.shape))})
+                )
+            elif isinstance(value, tf.data.Iterator):
+                spec["index"].append((path, str(type(value))))
+                spec["tf_ckpt_map"][path] = value
+            else:
+                spec["index"].append((path, value))
+        return spec
+
+    # pylint: disable-next=redefined-builtin
+    def ckpt_dir(self, step: int, dir: Optional[str] = None) -> str:
+        """Obtains the checkpoint dir for the given step."""
+        if dir is None:
+            dir = self._manager.directory
+        # pylint: disable-next=protected-access
+        return str(self._manager._get_save_directory(step, dir))
+
+    def save(
+        self, *, step: int, state: Nested[Tensor], evaler_summaries: Optional[Dict[str, Any]] = None
+    ):
+        """See `BaseCheckpointer.save` for details.
+
+        Checkpoint saving is handled by `orbax` checkpoint manager.
+        """
+        import orbax.checkpoint as ocp
+
+        spec = self._get_spec(step=step, state=state)
+        self._eval_summaries_sem.acquire()  # pylint: disable=consider-using-with
+        assert not self._eval_summaries
+        self._eval_summaries.update(evaler_summaries or {})
+        self._manager.save(
+            step=step,
+            # The input iterator is saved as part of `save_tf_savables`.
+            args=ocp.args.Composite(
+                index=self._index_args(spec["index"]),
+                tf_ckpt_map=self._tf_ckpt_args(spec["tf_ckpt_map"]),
+                state=ocp.args.StandardSave(
+                    utils.prune_tree(
+                        state, should_prune=lambda _, v: isinstance(v, tf.data.Iterator)
+                    )
+                ),
+            ),
+        )
+
+    def restore(
+        self,
+        *,
+        step: Optional[int] = None,
+        state: Union[Nested[Tensor], Nested[TensorSpec]],
+    ) -> Tuple[Optional[int], Nested[Tensor]]:
+        """See `BaseCheckpointer.restore` for details."""
+        import orbax.checkpoint as ocp
+
+        cfg: OrbaxCheckpointer.Config = self.config
+
+        spec = self._get_spec(step=step, state=state)
+        state_specs = jax.tree_util.tree_map(
+            lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding),
+            jax.tree_util.tree_map(lambda x: None if isinstance(x, tf.data.Iterator) else x, state),
+        )
+        try:
+            composite_state = self._manager.restore(
+                step,
+                args=ocp.args.Composite(
+                    tf_ckpt_map=self._tf_ckpt_args(spec["tf_ckpt_map"]),
+                    state=ocp.args.StandardRestore(state_specs),
+                ),
+            )
+            restored_state = composite_state["state"]
+        except Exception as e:  # pylint: disable=broad-except
+            if step is not None:
+                raise ValueError(f"Failed to restore at step {step}.") from e
+            logging.info("Could not find any completed checkpoints under %s: %s", cfg.dir, e)
+            restored_state = state
+
+        # If we successfully restored from step=None, use the latest step.
+        if step is None:
+            step = self._manager.latest_step()
+
+        # If step is non-None (i.e., not retuning input state), validate ckpt structure.
+        if step is not None:
+            spec = self._get_spec(step=step, state=restored_state)
+            restored_spec = self._manager.restore(
+                step, args=ocp.args.Composite(index=self._index_args(None))
+            )
+            check_state_structure(
+                restored_spec["index"],
+                target_structure=spec["index"],
+                validation=cfg.validation_type,
+            )
+        return step, restored_state
+
+    def wait_until_finished(self):
+        """See `BaseCheckpointer.wait_until_finished` docstring for details."""
+        self._manager.wait_until_finished()
+
+    def stop(self):
+        """See `BaseCheckpointer.stop` for details."""
+        self._manager.close()
+
+    def _wrap_handler(self, save_fn: Callable, restore_fn: Callable):
+        """Converts a save/restore fn to an orbax handler."""
+        import orbax.checkpoint as ocp
+
+        class Wrapper(ocp.CheckpointHandler):
+            def save(self, directory: Path, args: ocp.args.StandardSave):
+                return save_fn(directory, args)
+
+            def restore(self, directory: Path, args: ocp.args.StandardRestore):
+                return restore_fn(directory, args)
+
+        @dataclasses.dataclass
+        class WrapperArgs(ocp.args.CheckpointArgs):
+            item: Optional[ocp.utils.PyTree]
+
+        ocp.args.register_with_handler(Wrapper, for_save=True, for_restore=True)(WrapperArgs)
+
+        return Wrapper, WrapperArgs

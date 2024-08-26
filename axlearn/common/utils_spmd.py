@@ -8,6 +8,7 @@ from typing import Optional
 
 import jax
 import portpicker
+import orbax.checkpoint as ocp
 
 _jax_distributed_initialized = False
 
@@ -100,6 +101,7 @@ def setup(
                 try:
                     logging.info("Attempting to initialize JAX distributed system...")
                     jax.distributed.initialize(**init_kwargs)
+                    ocp.multihost.utils.initialize_runtime_to_distributed_ids()
                     _jax_distributed_initialized = True
                 except RuntimeError as e:
                     err_str = str(e)
@@ -116,4 +118,5 @@ def setup(
                 )
         else:
             jax.distributed.initialize(**init_kwargs)
+            ocp.multihost.utils.initialize_runtime_to_distributed_ids()
             _jax_distributed_initialized = True
