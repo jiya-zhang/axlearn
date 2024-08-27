@@ -437,6 +437,14 @@ class TPUGKEJob(GKEJob):
                 ),
             )
 
+        # Add ramdisk volume mount to container
+        volume_mounts.append(
+            dict(
+                mountPath="/cache",
+                name="ramdisk",
+            )
+        )
+
         env_vars = {**cfg.env_vars}
         if cfg.enable_tpu_ici_resiliency is not None:
             env_vars["ENABLE_ICI_RESILIENCY"] = str(cfg.enable_tpu_ici_resiliency).lower()
@@ -508,6 +516,16 @@ class TPUGKEJob(GKEJob):
                     ),
                 )
             )
+
+        # Add ramdisk volume to pod
+        volumes.append(
+            dict(
+                name="ramdisk",
+                csi=dict(
+                    driver="phase1-checkpoint.csi.storage.gke.io"
+                ),
+            )
+        )
 
         # If running from bastion, a scheduling tier will be specified in env.
         # Tier "0" corresponds to reserved; otherwise we use preemptible.
