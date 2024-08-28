@@ -5,6 +5,7 @@
 import logging
 import time
 from typing import Optional
+import orbax.checkpoint as ocp
 
 import jax
 import portpicker
@@ -100,6 +101,8 @@ def setup(
                 try:
                     logging.info("Attempting to initialize JAX distributed system...")
                     jax.distributed.initialize(**init_kwargs)
+                    if jax_backend == "tpu":
+                        ocp.multihost.utils.initialize_runtime_to_distributed_ids()
                     _jax_distributed_initialized = True
                 except RuntimeError as e:
                     err_str = str(e)
@@ -116,4 +119,6 @@ def setup(
                 )
         else:
             jax.distributed.initialize(**init_kwargs)
+            if jax_backend == "tpu":
+                ocp.multihost.utils.initialize_runtime_to_distributed_ids()
             _jax_distributed_initialized = True
