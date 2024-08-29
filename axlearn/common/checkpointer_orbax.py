@@ -298,12 +298,15 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
 
     @config_class
     class Config(BaseCheckpointer.Config):
-        """Configures OrbaxCheckpointer.
+        """Configures OrbaxEmergencyCheckpointer.
 
         Attributes:
             keep_last_n: Keep this many past ckpts.
             validation_type: Checkpoint validation during restore.
             async_timeout_secs: Timeout for async barrier in seconds.
+            local_checkpoint_dir: Local directory to store checkpoints.
+            local_save_interval_steps: Interval at which to save local checkpoints
+            persistent_save_interval_steps: Interval at which to save persistent checkpoints
         """
 
         keep_last_n: int = 1
@@ -419,14 +422,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             self._manager.save(
                 step=step,
                 # The input iterator is saved as part of `save_tf_savables`.
-                args=ocp.args.Composite(
-                    index=ocp.args.JsonSave(spec["index"]),
-                    # TODO(markblee): Investigate save_args for chunk_byte_size and
-                    # ocdbt_target_data_file_size:
-                    # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
-                    # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
-                    state=ocp.args.PyTreeSave(item=state),
-                ),
+                args=orbax.checkpoint.args.PyTreeSave(state),
             )
             # Exit early after pre-emption, equivalent to sys.exit():
             # https://orbax.readthedocs.io/en/latest/preemption_checkpointing.html
