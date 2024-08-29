@@ -9,6 +9,7 @@ import orbax.checkpoint as ocp
 
 import jax
 import portpicker
+from etils import epath
 
 _jax_distributed_initialized = False
 
@@ -20,6 +21,7 @@ def setup(
     num_processes: Optional[int] = None,
     process_id: Optional[int] = None,
     initialization_timeout: Optional[int] = None,
+    local_checkpoint_dir: Optional[str] = None,
 ):
     """Sets up the JAX environment for SPMD.
 
@@ -100,9 +102,11 @@ def setup(
             while not _jax_distributed_initialized and time.time() < max_time:
                 try:
                     logging.info("Attempting to initialize JAX distributed system...")
-                    jax.distributed.initialize(**init_kwargs)
-                    if jax_backend == "tpu":
-                        ocp.multihost.utils.initialize_runtime_to_distributed_ids()
+                    if local_checkpoint_dir is not None:
+                        logging.info("Using Emergency Checkpointing...")
+                        initialize_jax_for_tpu_with_emergency_checkpointing(local_checkpoint_dir,**init_kwargs)
+                    else:
+                        jax.distributed.initialize(**init_kwargs)
                     _jax_distributed_initialized = True
                 except RuntimeError as e:
                     err_str = str(e)
@@ -118,7 +122,47 @@ def setup(
                     f"({initialization_timeout} seconds)."
                 )
         else:
-            jax.distributed.initialize(**init_kwargs)
-            if jax_backend == "tpu":
-                ocp.multihost.utils.initialize_runtime_to_distributed_ids()
+            if local_checkpoint_dir is not None:
+                logging.info("2: Using Emergency Checkpointing."
+                            "Attempting to initialize JAX distributed system...")
+                initialize_jax_for_tpu_with_emergency_checkpointing(local_checkpoint_dir,**init_kwargs)
+            else:
+                jax.distributed.initialize(**init_kwargs)
             _jax_distributed_initialized = True
+
+def initialize_jax_for_tpu_with_emergency_checkpointing(local_checkpoint_dir,**init_kwargs):
+    """Initialize JAX distributed runtime for TPUs when emergency checkpointing is used.
+    The information required to initialize JAX distributed runtime will be written by GKE to
+    the local checkpoint directory. This function retrieves that information and initializes
+    JAX distributed runtime.
+    """
+    process_id, coordinator_address = _retrieve_jax_init_info(local_checkpoint_dir)
+
+    if process_id != "" and coordinator_address != "":
+        logging.info(f"Using {process_id} as the process_id and {coordinator_address} as the"
+                        " coordinator_address to initialize JAX distributed runtime...")
+        jax.distributed.initialize(coordinator_address=coordinator_address, process_id=int(process_id))
+    else:
+        logging.info("Initializing JAX distributed runtime without args when emergency checkpointing is"
+                        " enabled. This should not happen and your workload may have unexpected behavior.")
+        jax.distributed.initialize(**init_kwargs)
+
+    ocp.multihost.utils.initialize_runtime_to_distributed_ids()
+
+def _retrieve_jax_init_info(local_checkpoint_dir):
+    """Retrieve JAX init info from a local file."""
+    JAX_INIT_INFO_FILE = "jax-init-info.txt"
+    local_jax_init_info_file = epath.Path(local_checkpoint_dir) / JAX_INIT_INFO_FILE
+    # Allow time for the JAX init info file to be populated by GKE. This is needed because the file is
+    # only populated when the worker with process id of 0 is determined. After a disruption, although some
+    # workers might be up and running, the init info file won't be populated until the node with process id
+    # of 0 is known and this could take time. Using 900 seconds for now and it needs to be increased if the
+    # "repair" time is longer.
+    for i in range(900):
+        if local_jax_init_info_file.exists():
+        return local_jax_init_info_file.read_text().split('\n')[:2]
+        logging.info(f"Unable to locate {JAX_INIT_INFO_FILE} after {i} seconds, sleeping for 1 second before retrying...")
+        time.sleep(1)
+    logging.info(f"Unable to locate {JAX_INIT_INFO_FILE} after 900 seconds,"
+                    "returning empty process id and coordinator address.")
+    return "", ""
