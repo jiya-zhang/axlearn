@@ -327,6 +327,13 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         cfg: OrbaxEmergencyCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
 
+        if cfg.mesh_shape is None or cfg.mesh_axis_names is None:
+            raise ValueError("Orbax Emergency Checkpointer's mesh shape/axis names cannot be empty.")
+
+        devices = utils.create_device_mesh(mesh_shape=cfg.mesh_shape)
+        global_mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
+        logging.info(f"ORBAX global mesh:{global_mesh} and type: {type(global_mesh)}")
+
         # self._eval_summaries will be set in save() and used by save_fn_with_summaries() to decide
         # whether to save at the step.
         #
@@ -347,17 +354,9 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             step_format_fixed_length=STEP_NUM_DIGITS,
         )
 
-        PyTreeCheckpointHandler = ocp.pytree_checkpoint_handler.PyTreeCheckpointHandler
         LocalCheckpointOptions = emergency_checkpoint_manager.LocalCheckpointOptions
         PersistentCheckpointOptions = (
             emergency_checkpoint_manager.PersistentCheckpointOptions
-        )
-
-        local_checkpoint_handler = PyTreeCheckpointHandler(
-            use_ocdbt=True,
-            use_zarr3=True,
-            primary_host=None,
-            type_handler_registry=local_registry,
         )
 
         # Set the Checkpoint Manager options as relevant to local checkpointer
@@ -375,14 +374,15 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             async_options=ocp.options.AsyncOptions(timeout_secs=cfg.async_timeout_secs)
         )
 
-        # TODO: figure out global_mesh and abstract_state
+        # TODO (robhilton): get abstract_state
+        # See example: https://github.com/google/maxtext/blob/main/MaxText/max_utils.py#L770
         self._manager = emergency_checkpoint_manager.CheckpointManager(
             local_directory=cfg.local_checkpoint_dir,
             persistent_directory=cfg.dir,
             global_mesh=global_mesh,
             abstract_state=abstract_state,
             options=options,
-            local_state_handler=local_checkpoint_handler(),
+            local_state_handler=emergency_checkpoint_manager.local_checkpoint_handler(),
         )
 
 
@@ -414,11 +414,11 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
 
         Checkpoint saving is handled by `orbax` checkpoint manager.
         """
-        spec = self._get_spec(step=step, state=state)
         assert self._eval_summaries is None, self._eval_summaries
         self._eval_summaries = copy.deepcopy(evaler_summaries or {})
         try:
-            # Note that save() waits for prior serialization to finish.
+            # Sep 2024: Orbax Emergency Checkpointer does not support multiple item save yet
+            # We use a simple PyTree to save current state
             self._manager.save(
                 step=step,
                 # The input iterator is saved as part of `save_tf_savables`.
@@ -455,13 +455,13 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         restore_args = jax.tree_util.tree_map(_restore_args, state)
 
         try:
-            composite_state = self._manager.restore(
+            restored_state = self._manager.restore(
                 step,
-                args=ocp.args.Composite(
-                    index=ocp.args.JsonRestore(None),
-                    state=ocp.args.PyTreeRestore(item=state, restore_args=restore_args),
+                args=ocp.checkpoint.args.PyTreeRestore(
+                    item=state, restore_args=restore_args
                 ),
             )
+            restored_step = step
         except TypeError as e:
             # Orbax hits TypeError if there are no checkpoints, since it attempts to format `None`
             # as the step dir.
@@ -470,23 +470,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             logging.info("Could not find any completed checkpoints under %s: %s", cfg.dir, e)
             return None, state  # Return the input state.
 
-        restored_index = composite_state["index"]
-        restored_state = composite_state["state"]
-
-        # If we successfully restored from step=None, use the restored step.
-        if step is None:
-            for k, v in restored_index:
-                if k == "step":
-                    step = v
-                    break
-
-        # Validate ckpt structure.
-        check_state_structure(
-            restored_index,
-            target_structure=self._get_spec(step=step, state=state)["index"],
-            validation=cfg.validation_type,
-        )
-        return step, restored_state
+        return restored_step, restored_state
 
     def wait_until_finished(self):
         """See `BaseCheckpointer.wait_until_finished` docstring for details."""

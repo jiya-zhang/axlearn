@@ -241,6 +241,8 @@ class SpmdTrainer(Module):
             self._add_child("model", cfg.model)
             self._add_child("learner", cfg.learner)
             cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
+            cfg.checkpointer.mesh_shape = cfg.mesh_shape
+            cfg.checkpointer.mesh_axis_names = cfg.mesh_axis_names
             self._add_child("checkpointer", cfg.checkpointer)
             if cfg.init_state_builder is not None:
                 self._add_child("init_state_builder", cfg.init_state_builder)

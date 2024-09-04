@@ -102,6 +102,7 @@ def setup(
             while not _jax_distributed_initialized and time.time() < max_time:
                 try:
                     logging.info("Attempting to initialize JAX distributed system...")
+                    logging.info(f"LOCAL CHECKPOINT DIR = {local_checkpoint_dir}")
                     if local_checkpoint_dir is not None:
                         logging.info("Using Emergency Checkpointing...")
                         initialize_jax_for_tpu_with_emergency_checkpointing(local_checkpoint_dir,**init_kwargs)
@@ -160,7 +161,7 @@ def _retrieve_jax_init_info(local_checkpoint_dir):
     # "repair" time is longer.
     for i in range(900):
         if local_jax_init_info_file.exists():
-        return local_jax_init_info_file.read_text().split('\n')[:2]
+            return local_jax_init_info_file.read_text().split('\n')[:2]
         logging.info(f"Unable to locate {JAX_INIT_INFO_FILE} after {i} seconds, sleeping for 1 second before retrying...")
         time.sleep(1)
     logging.info(f"Unable to locate {JAX_INIT_INFO_FILE} after 900 seconds,"
