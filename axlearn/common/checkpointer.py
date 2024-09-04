@@ -637,6 +637,8 @@ class BaseCheckpointer(Module):
         save_policy: InstantiableConfig[CheckpointPolicy] = config_for_function(
             every_n_steps_policy
         )
+        mesh_shape: Optional[Any] = None
+        mesh_axis_names: Optional[Any] = None
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> list[str]:

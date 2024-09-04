@@ -141,6 +141,7 @@ mmau = [
 orbax = [
     "humanize==4.10.0",
     "orbax-checkpoint==0.5.23",
+    "etils==1.7.0",
 ]
 
 [tool.flit.module]

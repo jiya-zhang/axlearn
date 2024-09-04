@@ -87,6 +87,11 @@ flags.DEFINE_integer(
     os.environ.get("PROCESS_ID", None),
     "Rank of the current process. Must be None on tpu, otherwise required.",
 )
+flags.DEFINE_string(
+    "local_checkpoint_dir",
+    os.environ.get("LOCAL_CHECKPOINT_DIR", None),
+    "Local directory to store checkpoints. If None, assume not using in memory checkpointing.",
+)
 
 
 FLAGS = flags.FLAGS
@@ -99,6 +104,7 @@ def setup():
         process_id=FLAGS.process_id,
         jax_backend=FLAGS.jax_backend,
         initialization_timeout=FLAGS.initialization_timeout,
+        local_checkpoint_dir=FLAGS.local_checkpoint_dir,
     )
 
     if FLAGS.jax_profiler_port is not None:
