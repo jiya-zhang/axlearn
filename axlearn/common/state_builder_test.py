@@ -5,7 +5,7 @@
 # pylint: disable=no-self-use,too-many-lines
 import os
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
@@ -494,21 +494,28 @@ class DummyNestedLayer(BaseLayer):
 
         layer: InstantiableConfig = Linear.default_config().set(input_dim=5, output_dim=2)
         path: Required[str] = REQUIRED
+        path2: Optional[str] = None
 
     def __init__(self, cfg: BaseModel.Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
         cfg = self.config
-        if "/" not in cfg.path:
-            self._add_child(cfg.path, cfg.layer)
-        else:
-            name, path = cfg.path.split("/", maxsplit=1)
-            self._add_child(
-                name,
-                DummyNestedLayer.default_config().set(
-                    layer=cfg.layer,
-                    path=path,
-                ),
-            )
+
+        def add_nested_child(path):
+            if "/" not in path:
+                self._add_child(path, cfg.layer)
+            else:
+                name, sub_path = path.split("/", maxsplit=1)
+                self._add_child(
+                    name,
+                    DummyNestedLayer.default_config().set(
+                        layer=cfg.layer,
+                        path=sub_path,
+                    ),
+                )
+
+        add_nested_child(cfg.path)
+        if cfg.path2 is not None:
+            add_nested_child(cfg.path2)
 
 
 class DummyNestedModel(BaseModel):
@@ -520,6 +527,7 @@ class DummyNestedModel(BaseModel):
 
         layer: InstantiableConfig = Linear.default_config().set(input_dim=5, output_dim=2)
         path: Required[str] = REQUIRED
+        path2: Optional[str] = None
 
     def __init__(self, cfg: BaseModel.Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
@@ -528,6 +536,7 @@ class DummyNestedModel(BaseModel):
             "model",
             DummyNestedLayer.default_config().set(
                 path=cfg.path,
+                path2=cfg.path2,
                 layer=cfg.layer,
             ),
         )
@@ -794,7 +803,7 @@ class DiffusersPretrainedBuilderTest(TestCase):
                 model=model.create_parameter_specs_recursively(),
                 learner=None,
             )
-            trainer_state_partition_specs = jax.tree_util.tree_map(
+            trainer_state_partition_specs = jax.tree.map(
                 lambda spec: spec.mesh_axes, trainer_state_specs
             )
 
@@ -874,7 +883,7 @@ class HuggingFacePreTrainedBuilderTest(TestCase):
                 model=model.create_parameter_specs_recursively(),
                 learner=None,
             )
-            trainer_state_partition_specs = jax.tree_util.tree_map(
+            trainer_state_partition_specs = jax.tree.map(
                 lambda spec: spec.mesh_axes, trainer_state_specs
             )
 
@@ -935,7 +944,7 @@ class HuggingFacePreTrainedBuilderTest(TestCase):
                 model=model.create_parameter_specs_recursively(),
                 learner=None,
             )
-            trainer_state_partition_specs = jax.tree_util.tree_map(
+            trainer_state_partition_specs = jax.tree.map(
                 lambda spec: spec.mesh_axes, trainer_state_specs
             )
 
@@ -1031,9 +1040,7 @@ def _create_dummy_state(prng_key, model_config=DummyModel.default_config(), use_
     trainer_state = trainer.trainer_state
     if use_ema:
         trainer_state.learner["ema"] = trainer_state.learner["ema"]._replace(
-            ema=jax.tree_util.tree_map(
-                lambda p: -jnp.ones_like(p), trainer.trainer_state.learner["ema"].ema
-            )
+            ema=jax.tree.map(lambda p: -jnp.ones_like(p), trainer.trainer_state.learner["ema"].ema)
         )
     return config_for_function(trainer_cfg_fn), Builder.State(
         step=0, trainer_state=trainer_state, built_keys=set()
@@ -1160,6 +1167,139 @@ class ModelStateScopeConverterTest(TestCase):
         self.assertNestedAllClose(
             converted_state.trainer_state.model["linear2"]["bias"],
             target_state.trainer_state.model["linear2"]["bias"],
+        )
+
+    def _create_fake_state_and_convert(self, scope_mapping: Dict[str, str]):
+        # Create fake source_state and target_state with nested layers.
+        source_cfg, source_state = _create_dummy_state(
+            jax.random.PRNGKey(0),
+            DummyNestedModel.default_config().set(path="linear", path2="linear2"),
+        )
+        _, target_state = _create_dummy_state(
+            jax.random.PRNGKey(1),
+            DummyModel.default_config().set(
+                child=DummyNestedLayer.default_config().set(path="linear")
+            ),
+        )
+
+        converter = (
+            ModelStateScopeConverter.default_config()
+            .set(
+                name="test",
+                source_trainer_config=source_cfg,
+                scope=scope_mapping,
+            )
+            .instantiate(parent=None)
+        )
+        converted_state = converter.source_to_target(source_state, target_state)
+        return source_state, converted_state
+
+    @parameterized.parameters(
+        {"scope_mapping": {"linear": "model/linear", "child": "model"}},
+        {"scope_mapping": {"linear/bias": "model/linear/bias", "child": "model"}},
+        {
+            "scope_mapping": {
+                "linear/bias": "model/linear/bias",
+                "child/linear": "model/linear",
+                "child": "model",
+            }
+        },
+        {
+            "scope_mapping": {
+                "linear/bias": "model/linear/bias",
+                "child": "model",
+                "child/linear": "model/linear",
+            }
+        },
+    )
+    def test_duplicate_source_scopes_leaf_first(self, scope_mapping):
+        # Map leaf first.
+        # Create fake source_state and target_state with nested layers and perform conversion.
+        source_state, converted_state = self._create_fake_state_and_convert(scope_mapping)
+
+        self.assertNestedAllClose(
+            converted_state.trainer_state.model["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+        self.assertNestedAllClose(
+            converted_state.trainer_state.model["child"]["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+        # converted_state's "linear/bias" is donated.
+        self.assertIs(
+            converted_state.trainer_state.model["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+        # converted_state's "child" is a copy and has different memory.
+        self.assertIsNot(
+            converted_state.trainer_state.model["child"]["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+
+    @parameterized.parameters(
+        {"scope_mapping": {"child/linear": "model/linear", "linear": "model/linear"}},
+        {"scope_mapping": {"child/linear": "model/linear", "linear/bias": "model/linear/bias"}},
+        {"scope_mapping": {"child": "model", "linear/bias": "model/linear/bias"}},
+    )
+    def test_duplicate_source_scopes_leaf_last(self, scope_mapping):
+        # Map leaf at last.
+
+        # Create fake source_state and target_state with nested layers and perform conversion.
+        source_state, converted_state = self._create_fake_state_and_convert(scope_mapping)
+
+        self.assertNestedAllClose(
+            converted_state.trainer_state.model["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+        self.assertNestedAllClose(
+            converted_state.trainer_state.model["child"]["linear"],
+            source_state.trainer_state.model["model"]["linear"],
+        )
+        # source_state's "model" is donated to coverted_state's "child".
+        self.assertIs(
+            converted_state.trainer_state.model["child"]["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+        self.assertIs(
+            converted_state.trainer_state.model["child"]["linear"]["weight"],
+            source_state.trainer_state.model["model"]["linear"]["weight"],
+        )
+        # converted_state's "linear/bias" is a copy and has different memory.
+        self.assertIsNot(
+            converted_state.trainer_state.model["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+
+    def test_duplicate_source_scopes_edge_case(self):
+        # Create fake source_state and target_state with nested layers and perform conversion.
+        scope_mapping = {"linear": "model/linear", "child/linear": "model/linear2"}
+        source_state, converted_state = self._create_fake_state_and_convert(scope_mapping)
+
+        self.assertNestedAllClose(
+            converted_state.trainer_state.model["linear"],
+            source_state.trainer_state.model["model"]["linear"],
+        )
+        self.assertNestedAllClose(
+            converted_state.trainer_state.model["child"]["linear"],
+            source_state.trainer_state.model["model"]["linear2"],
+        )
+        # converted_state's "linear" is donated.
+        self.assertIs(
+            converted_state.trainer_state.model["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear"]["bias"],
+        )
+        self.assertIs(
+            converted_state.trainer_state.model["linear"]["weight"],
+            source_state.trainer_state.model["model"]["linear"]["weight"],
+        )
+        # converted_state's "child/linear" is also donated.
+        self.assertIs(
+            converted_state.trainer_state.model["child"]["linear"]["bias"],
+            source_state.trainer_state.model["model"]["linear2"]["bias"],
+        )
+        self.assertIs(
+            converted_state.trainer_state.model["child"]["linear"]["weight"],
+            source_state.trainer_state.model["model"]["linear2"]["weight"],
         )
 
     @parameterized.parameters(None, "FAKE")

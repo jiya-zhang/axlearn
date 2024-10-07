@@ -2,12 +2,14 @@
 
 """Utilities to provision TPU node pools."""
 import hashlib
+import io
 import os
 import time
 from typing import Optional
 
 from absl import flags, logging
 
+from axlearn.cloud.common.bastion import _BASTION_SERIALIZED_JOBSPEC_ENV_VAR, deserialize_jobspec
 from axlearn.cloud.gcp.config import gcp_settings
 from axlearn.cloud.gcp.job import AcceleratorConfig, GKEJob, TPUGKEJob
 from axlearn.cloud.gcp.node_pool import (
@@ -83,6 +85,7 @@ class TPUNodePoolProvisioner(NodePoolProvisioner):
         reservation = job_cfg.reservation
         location_hint = job_cfg.location_hint
         enable_tpu_ici_resiliency = job_cfg.enable_tpu_ici_resiliency
+        enable_tpu_smart_repair = job_cfg.enable_tpu_smart_repair
         tpu_type = infer_tpu_type(acc_cfg.instance_type)
         job_sys_property = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[tpu_type]
         num_node_pools = acc_cfg.num_replicas
@@ -95,6 +98,13 @@ class TPUNodePoolProvisioner(NodePoolProvisioner):
             logging.info("Found tier=%s in env. Using spot quota", tier)
             use_spot_vm = True
             reservation = None
+
+        job_priority = None
+        if os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR):
+            spec = deserialize_jobspec(
+                io.StringIO(os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR))
+            )
+            job_priority = spec.metadata.priority
 
         node_pool_names = []
         additional_labels_list = []
@@ -113,6 +123,14 @@ class TPUNodePoolProvisioner(NodePoolProvisioner):
                 f"{job_cfg.namespace}/{job_cfg.name}-job-{i}".encode()
             ).hexdigest()
             additional_labels = {"job-key": job_key}
+
+            # Populate job-priority label to nodes.
+            if job_priority is not None:
+                additional_labels.update({"job-priority": str(job_priority)})
+
+            if enable_tpu_smart_repair:
+                additional_labels.update({"cloud.google.com/gke-tpu-auto-restart": "true"})
+
             additional_labels_list.append(additional_labels)
 
         start_time = time.perf_counter()

@@ -29,6 +29,7 @@ from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from jax.experimental.array_serialization import serialization as array_serialization
 
+from axlearn.common import file_system as fs
 from axlearn.common import serialization, test_utils, utils
 from axlearn.common.array_serialization import BoundedDataShardedAsyncCheckpointManager
 from axlearn.common.checkpointer import (
@@ -160,7 +161,7 @@ class CheckpointerTest(test_utils.TestCase):
         step = 1
 
         def state_specs(state, partition_spec):
-            return jax.tree_util.tree_map(
+            return jax.tree.map(
                 lambda x: utils.TensorSpec(shape=x.shape, dtype=x.dtype, mesh_axes=partition_spec),
                 state,
             )
@@ -170,7 +171,7 @@ class CheckpointerTest(test_utils.TestCase):
             sharding = jax.sharding.NamedSharding(
                 mesh, spec=jax.sharding.PartitionSpec("data", "model")
             )
-            state = jax.tree_util.tree_map(lambda x: jax.device_put(x, device=sharding), state)
+            state = jax.tree.map(lambda x: jax.device_put(x, device=sharding), state)
             ckpt.save(step=step, state=state)
             ckpt.wait_until_finished()
 
@@ -217,7 +218,7 @@ class CheckpointerTest(test_utils.TestCase):
                     )
                 else:
                     raise NotImplementedError(checkpointer_cls)
-                tf.io.gfile.makedirs(ckpt_dir)
+                fs.makedirs(ckpt_dir)
 
                 if checkpointer_cls is OrbaxCheckpointer:
                     assert not ocp.step.is_checkpoint_finalized(ckpt_dir)
@@ -404,6 +405,11 @@ class CheckpointerTest(test_utils.TestCase):
                 gc_loop_interval_seconds=1,
             )
             cfg.save_policy.min_step = 0
+
+            # Running gc for non-existent dir shouldn't fail.
+            ckpt_fake = cfg.clone(dir=os.path.join(temp_dir, "fake_dir")).instantiate(parent=None)
+            ckpt_fake._run_garbage_collection()
+
             ckpt: Checkpointer = cfg.instantiate(parent=None)
             state = dict(x=jnp.zeros([], dtype=jnp.int32))
 
@@ -766,9 +772,7 @@ class CheckpointerTest(test_utils.TestCase):
             state_spec = read_state_spec(checkpointer_cls.latest_checkpoint_path(cfg.dir))
             self.assertNestedEqual(
                 state_spec,
-                jax.tree_util.tree_map(
-                    lambda t: utils.TensorSpec(shape=t.shape, dtype=t.dtype), state0
-                ),
+                jax.tree.map(lambda t: utils.TensorSpec(shape=t.shape, dtype=t.dtype), state0),
             )
             step, state1 = ckpt.restore(state=state_spec)
             self.assertNestedEqual(0, step)
@@ -810,7 +814,7 @@ class CheckpointerTest(test_utils.TestCase):
                 ckpt: Checkpointer = cfg.instantiate(parent=None)
                 # VDict with out of order keys.
                 state0 = dict(a=3, b=SwitchableVDict(d=6, b=5))
-                state0 = jax.tree_util.tree_map(jnp.asarray, state0)
+                state0 = jax.tree.map(jnp.asarray, state0)
                 self.assertEqual(list(state0["b"].keys()), ["d", "b"])
                 ckpt.save(step=0, state=state0)
                 ckpt.wait_until_finished()
@@ -823,7 +827,7 @@ class CheckpointerTest(test_utils.TestCase):
                 self.assertNestedEqual(state0, result)
                 self.assertEqual(list(result["b"].keys()), ["b", "d"])
 
-                after_tree_map = jax.tree_util.tree_map(lambda x: x, result)
+                after_tree_map = jax.tree.map(lambda x: x, result)
                 self.assertEqual(list(after_tree_map["b"].keys()), ["b", "d"])
 
                 _, result = ckpt.restore(step=0, state=after_tree_map)
@@ -844,6 +848,13 @@ class TensorStoreStateStorageTest(test_utils.TestCase):
             self.assertIsInstance(
                 storage._manager, array_serialization.GlobalAsyncCheckpointManager
             )
+
+    def test_max_concurrent_restore_gb_setting(self):
+        with self.assertRaisesRegex(ValueError, "strictly positive"):
+            TensorStoreStateStorage.default_config().set(max_concurrent_restore_gb=-2).instantiate()
+        t = TensorStoreStateStorage.default_config().instantiate()
+        # Test default value.
+        self.assertEqual(t._max_concurrent_restore_gb, 32)
 
     def test_stop(self):
         storage = TensorStoreStateStorage.default_config().instantiate()
@@ -928,7 +939,7 @@ def _write_shards(lines: Iterable[str], *, path_prefix, num_shards) -> list[str]
     filenames = [
         f"{path_prefix}-{shard_id:05d}-of-{num_shards:05d}" for shard_id in range(num_shards)
     ]
-    files = [tf.io.gfile.GFile(filename, "w") for filename in filenames]
+    files = [fs.open(filename, "w") for filename in filenames]
     for i, line in enumerate(lines):
         files[i % num_shards].write(line + "\n")
     return filenames
