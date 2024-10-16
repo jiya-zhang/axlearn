@@ -103,6 +103,8 @@ def get_trainer_config(
 
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
+    if flag_values.local_checkpoint_dir is not None:
+        trainer_config.checkpointer.local_checkpoint_dir = FLAGS.local_checkpoint_dir
 
     return trainer_config
 

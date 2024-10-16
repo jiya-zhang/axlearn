@@ -446,6 +446,7 @@ class TPUGKEJob(GKEJob):
             )
 
         # Add ramdisk volume mount to container
+        # TODO: Currently the mount path is always "/cache", this should be aligned with user-defined local_checkpoint_dir
         volume_mounts.append(
             dict(
                 mountPath="/cache",

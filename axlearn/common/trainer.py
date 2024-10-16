@@ -250,10 +250,7 @@ class SpmdTrainer(Module):
             self._add_child("summary_writer", cfg.summary_writer)
             self._add_child("model", cfg.model)
             self._add_child("learner", cfg.learner)
-            cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
-            cfg.checkpointer.mesh_shape = cfg.mesh_shape
-            cfg.checkpointer.mesh_axis_names = cfg.mesh_axis_names
-            self._add_child("checkpointer", cfg.checkpointer)
+
             if cfg.init_state_builder is not None:
                 self._add_child("init_state_builder", cfg.init_state_builder)
 
@@ -273,6 +270,12 @@ class SpmdTrainer(Module):
                 model=self._model_param_specs,
                 learner=self._learner_state_partition_specs,
             )
+            cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
+            cfg.checkpointer.mesh_shape = cfg.mesh_shape
+            cfg.checkpointer.mesh_axis_names = cfg.mesh_axis_names
+            cfg.checkpointer.abstract_state = self._trainer_state_specs.model
+            self._add_child("checkpointer", cfg.checkpointer)
+
             self._trainer_state_partition_specs = jax.tree.map(
                 lambda spec: spec.mesh_axes, self._trainer_state_specs
             )

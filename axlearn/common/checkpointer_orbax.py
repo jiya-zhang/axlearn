@@ -33,7 +33,7 @@ from axlearn.common.utils import Nested, Tensor, TensorSpec
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 
 
-class _TfIteratorHandler(ocp.pytree_checkpoint_handler.TypeHandler):
+class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     """Serializes tf.data.Iterator.
 
     Reference:
@@ -312,9 +312,14 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         keep_last_n: int = 1
         validation_type: CheckpointValidationType = CheckpointValidationType.EXACT
         async_timeout_secs: int = 300
-        local_checkpoint_dir: Optional[str] = "/cache"
+        local_checkpoint_dir: Optional[str] = None
         local_save_interval_steps: Optional[int] = 50
-        persistent_save_interval_steps: Optional[int] = 5000
+        # TODO: persistent_save_interval_steps should align with trainer_config's setting
+        persistent_save_interval_steps: Optional[int] = 100
+        # The following configs are required for instantiating an Orbax Emergency Checkpointer
+        mesh_shape: Optional[Any] = None
+        mesh_axis_names: Optional[Any] = None
+        abstract_state: Optional[Any] = None
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -332,7 +337,6 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
 
         devices = utils.create_device_mesh(mesh_shape=cfg.mesh_shape)
         global_mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
-        logging.info(f"ORBAX global mesh:{global_mesh} and type: {type(global_mesh)}")
 
         # self._eval_summaries will be set in save() and used by save_fn_with_summaries() to decide
         # whether to save at the step.
@@ -371,16 +375,15 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             ),
             step_name_format=self._name_format,
             enable_async_checkpointing=True,
+            replica_axis_index=1,
             async_options=ocp.options.AsyncOptions(timeout_secs=cfg.async_timeout_secs)
         )
 
-        # TODO (robhilton): get abstract_state
-        # See example: https://github.com/google/maxtext/blob/main/MaxText/max_utils.py#L770
         self._manager = emergency_checkpoint_manager.CheckpointManager(
             local_directory=cfg.local_checkpoint_dir,
             persistent_directory=cfg.dir,
             global_mesh=global_mesh,
-            abstract_state=abstract_state,
+            abstract_state=cfg.abstract_state,
             options=options,
             local_state_handler=emergency_checkpoint_manager.local_checkpoint_handler(),
         )
@@ -422,7 +425,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             self._manager.save(
                 step=step,
                 # The input iterator is saved as part of `save_tf_savables`.
-                args=orbax.checkpoint.args.PyTreeSave(state),
+                args=ocp.args.PyTreeSave(state),
             )
             # Exit early after pre-emption, equivalent to sys.exit():
             # https://orbax.readthedocs.io/en/latest/preemption_checkpointing.html
@@ -457,7 +460,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         try:
             restored_state = self._manager.restore(
                 step,
-                args=ocp.checkpoint.args.PyTreeRestore(
+                args=ocp.args.PyTreeRestore(
                     item=state, restore_args=restore_args
                 ),
             )
