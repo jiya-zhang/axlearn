@@ -291,9 +291,10 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
 
 class OrbaxEmergencyCheckpointer(BaseCheckpointer):
-    """A checkpointer that uses orbax Emergency CheckpointManager.
+    """A checkpointer that uses orbax Emergency CheckpointManager, enabling
+    in memory checkpointing capabilities.
     Note: This checkpointer is experimental and may not support all functionalities
-    provided by orbax CheckpointManager.
+    provided by Orbax CheckpointManager.
     """
 
     @config_class
@@ -305,17 +306,20 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             validation_type: Checkpoint validation during restore.
             async_timeout_secs: Timeout for async barrier in seconds.
             local_checkpoint_dir: Local directory to store checkpoints.
-            local_save_interval_steps: Interval at which to save local checkpoints
-            persistent_save_interval_steps: Interval at which to save persistent checkpoints
+            local_save_interval_steps: Interval at which to save local checkpoints.
+            persistent_save_interval_steps: Interval at which to save persistent checkpoints.
+            mesh_shape: Used to generate global mesh for CheckpointManager initiation.
+            mesh_axis_names: Used to generate global mesh for CheckpointManager initiation.
+            abstract_state: A single PyTree describing the state structure.
         """
 
         keep_last_n: int = 1
         validation_type: CheckpointValidationType = CheckpointValidationType.EXACT
         async_timeout_secs: int = 300
         local_checkpoint_dir: Optional[str] = None
-        local_save_interval_steps: Optional[int] = 50
+        local_save_interval_steps: Optional[int] = 2000
         # TODO: persistent_save_interval_steps should align with trainer_config's setting
-        persistent_save_interval_steps: Optional[int] = 100
+        persistent_save_interval_steps: Optional[int] = 800000
         # The following configs are required for instantiating an Orbax Emergency Checkpointer
         mesh_shape: Optional[Any] = None
         mesh_axis_names: Optional[Any] = None
@@ -363,7 +367,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             emergency_checkpoint_manager.PersistentCheckpointOptions
         )
 
-        # Set the Checkpoint Manager options as relevant to local checkpointer
+        # Set the Checkpoint Manager options as relevant to local and persistent checkpointer
         # See: https://github.com/google/orbax/blob/main/checkpoint/orbax/checkpoint/experimental/emergency/checkpoint_manager.py#L206
         options = emergency_checkpoint_manager.CheckpointManagerOptions(
             local=LocalCheckpointOptions(
@@ -375,7 +379,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             ),
             step_name_format=self._name_format,
             enable_async_checkpointing=True,
-            replica_axis_index=1,
+            replica_axis_index=1, # the axis index for data parallelism
             async_options=ocp.options.AsyncOptions(timeout_secs=cfg.async_timeout_secs)
         )
 
@@ -387,21 +391,6 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             options=options,
             local_state_handler=emergency_checkpoint_manager.local_checkpoint_handler(),
         )
-
-
-    def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
-        spec = {"index": [("step", step)]}
-        for path, value in utils.flatten_items(state):
-            if isinstance(value, (Tensor, TensorSpec)):
-                dtype = getattr(value.dtype, "dtype", value.dtype)
-                spec["index"].append(
-                    (path, {"dtype": str(dtype), "shape": str(tuple(value.shape))})
-                )
-            elif isinstance(value, tf.data.Iterator):
-                spec["index"].append((path, str(type(value))))
-            else:
-                spec["index"].append((path, value))
-        return spec
 
     # pylint: disable-next=redefined-builtin
     def ckpt_dir(self, step: int, dir: Optional[str] = None) -> str:
@@ -464,7 +453,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
                     item=state, restore_args=restore_args
                 ),
             )
-            restored_step = step
+            restored_step = self._manager.latest_step()
         except TypeError as e:
             # Orbax hits TypeError if there are no checkpoints, since it attempts to format `None`
             # as the step dir.

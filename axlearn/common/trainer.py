@@ -721,7 +721,9 @@ class SpmdTrainer(Module):
         cfg = self.config
 
         # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
+        logging.info(f"MAGGIEJZ: prepare training. Self.step before restoring:{self.step}")
         self.restore_checkpoint(restore_step=None)
+        logging.info(f"MAGGIEJZ: prepare training. Self.step after restoring:{self.step}")
 
         if self.step is None:
             # If we didn't restore from checkpoint, attempt to build initial state according
@@ -774,12 +776,14 @@ class SpmdTrainer(Module):
             restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
+                logging.info(f"MAGGIEJZ: SPMD trainer restore_checkpoint. Trying to restore...")
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
                         ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
                     ),
                 )
+                logging.info(f"MAGGIEJZ: SPMD trainer restore_checkpoint. Restored step:{step}")
                 if step is not None:
                     self.vlog(
                         0,
@@ -808,6 +812,7 @@ class SpmdTrainer(Module):
                         step,
                         restore_input_iter,
                     )
+            logging.info(f"MAGGIEJZ: SPMD trainer restore_checkpoint. Restored step 2:{step}")
             if step is not None:
                 self._step = step
                 self._trainer_state = TrainerState(
