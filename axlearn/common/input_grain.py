@@ -35,12 +35,17 @@ from typing import Any, Callable, Optional, Protocol, Sequence, TypeVar, Union, 
 
 import grain.python as grain
 import jax
+import jax.numpy as jnp
 import numpy as np
+from absl import logging
 from array_record.python.array_record_data_source import PathLikeOrFileInstruction
 from grain._src.python.data_loader import _determine_worker_count
+from grain._src.python.dataset import stats as dataset_stats
 from grain._src.python.dataset.transformations import packing
+from grain._src.python.dataset.transformations import slice as slice_dataset
+from jax.experimental import multihost_utils
 
-from axlearn.common import utils
+from axlearn.common import input_base, utils
 from axlearn.common.config import (
     REQUIRED,
     ConfigOr,
@@ -366,6 +371,31 @@ def trim_and_pack_dataset(ds: Dataset, *, feature_lengths: utils.Nested[int]) ->
     return packing.SingleBinPackIterDataset(parent=ds, length_struct=feature_lengths)
 
 
+class _ShardDataset(slice_dataset.SliceMapDataset):
+    """A thin wrapper of SliceMapDataset that allows setting read config after instantiation.
+
+    This is used in `Input` for input dispatch.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._iterated = False
+
+    def set_read_config(self, *, num_shards: int, shard_index: int):
+        """Sets the shard index and count.
+
+        The API follows that of `tfds_read_config`.
+        """
+        if self._iterated:
+            raise ValueError("Attempting to `set_read_config` after iterating.")
+        self._start = shard_index
+        self._step = num_shards
+
+    def __getitem__(self, index):
+        self._iterated = True
+        return super().__getitem__(index)
+
+
 def shard_dataset(
     ds: Dataset,
     *,
@@ -392,7 +422,7 @@ def shard_dataset(
         process_index = jax.process_index()
     if not 0 <= process_index < process_count:
         raise ValueError(f"{process_index=} should be between 0 and {process_count=}, exclusive.")
-    return ds.slice(slice(process_index, None, process_count))
+    return _ShardDataset(parent=ds, sl=slice(process_index, None, process_count))
 
 
 def prefetch_dataset(
@@ -428,23 +458,167 @@ def prefetch_dataset(
     return ds.prefetch(multiprocessing_options)
 
 
-class Input(Module):
+class _FixedLengthDatasetIterator(grain.DatasetIterator):
+    """Iterate for a fixed length, truncating or producing padding examples as needed."""
+
+    def __init__(
+        self,
+        parent: grain.DatasetIterator,
+        *,
+        pad_example: Any,
+        length: int,
+        stats: dataset_stats.Stats,
+    ):
+        super().__init__(stats)
+        self._parent = parent
+        self._pad_example = pad_example
+        self._length = length
+        self._i = 0
+
+    def __len__(self):
+        return self._length
+
+    def __next__(self):
+        if self._i >= self._length:
+            raise StopIteration
+        try:
+            element = next(self._parent)
+        except StopIteration:
+            element = self._pad_example
+        self._i += 1
+        return element
+
+    def get_state(self):
+        return {
+            "parent": self._parent.get_state(),
+            "i": self._i,
+        }
+
+    def set_state(self, state: dict[str, Any]):
+        self._parent.set_state(state["parent"])
+        self._i = state["i"]
+
+
+class _FixedLengthIterDataset(grain.IterDataset):
+    """An iter dataset that has a fixed length, truncating or padding as needed."""
+
+    def __init__(self, parent: grain.IterDataset, *, pad_example: Any, length: int):
+        super().__init__(parent)
+        self._length = length
+        self._pad_example = pad_example
+
+    def __len__(self):
+        return self._length
+
+    def __iter__(self):
+        parent_iter = self._parent.__iter__()
+        return _FixedLengthDatasetIterator(
+            parent_iter,
+            pad_example=self._pad_example,
+            length=self._length,
+            stats=self._stats,
+        )
+
+
+# TODO(markblee): De-dup with input_tf_data.
+def pad_for_evaluation(
+    ds: Dataset,
+    *,
+    per_feed_batch_size: int,
+    pad_example_fn: PadExampleFn = default_pad_example_fn,
+    max_num_examples: int = 64_000,
+) -> grain.IterDataset:
+    """Pads the dataset to be a multiple of `per_feed_batch_size`.
+
+    The processor will ensure that all data feeds pad to the same number of batches to avoid
+    potential "last batch" problems.
+
+    Args:
+        ds: A Dataset. If an IterDataset, the cardinality will be manually counted, which requires
+            iterating through the dataset. This is mostly tolerable for evaluation datasets that are
+            relatively small.
+        per_feed_batch_size: Per-feed batch size.
+        pad_example_fn: A callable that takes an example and returns a padding example.
+        max_num_examples: An upper bound on the number of examples expected in the dataset. This is
+            mainly to avoid blocking indefinitely in the case where the input dataset is infinite.
+            If a manual count of the dataset cardinality exceeds this value, we raise to avoid
+            silently truncating the dataset.
+
+    Returns:
+        A padded dataset.
+
+    Raises:
+        ValueError: If evaluation dataset is empty or infinite; or if a manual count of the dataset
+            size exceeds `max_num_examples`.
+    """
+    try:
+        num_examples = len(ds)
+        logging.info("Dataset %s has known cardinality: %s", ds, num_examples)
+    except TypeError:
+        logging.warning("Dataset %s has no known cardinality. Will attempt to count.", ds)
+        num_examples = 0
+        for _ in ds:
+            num_examples += 1
+            if num_examples >= max_num_examples:
+                # pylint: disable-next=raise-missing-from
+                raise ValueError(f"Giving up on counting eval dataset after {max_num_examples}.")
+
+    # This case can happen if a map dataset calls `ds.repeat`.
+    if num_examples >= sys.maxsize:
+        raise ValueError(f"Evaluation dataset cannot have infinite cardinality: {ds}")
+    if num_examples <= 0:
+        raise ValueError(f"Evaluation dataset cannot be empty: {ds}")
+
+    target_num_examples = num_examples
+    if num_examples % per_feed_batch_size != 0:
+        target_num_examples += per_feed_batch_size - num_examples % per_feed_batch_size
+    if jax.process_count() > 1:
+        # Ensure that we do not run into the "last batch" problem.
+        # See: https://jax.readthedocs.io/en/latest/multi_process.html
+        target_num_examples = int(
+            jnp.max(
+                multihost_utils.process_allgather(jnp.array([target_num_examples]), tiled=False)
+            )
+        )
+
+    if num_examples < target_num_examples:
+        pad_example = pad_example_fn(next(iter(ds)))
+        logging.info("Padding evaluation dataset from %s to %s.", num_examples, target_num_examples)
+        ds = _FixedLengthIterDataset(ds, pad_example=pad_example, length=target_num_examples)
+
+    return ds
+
+
+def _set_read_config_recursively(source: Dataset, **kwargs) -> bool:
+    """Sets **kwargs on all `shard_dataset` in `source`."""
+    if isinstance(source, _ShardDataset):
+        logging.info("Setting read config on %s", source)
+        source.set_read_config(**kwargs)
+        return True
+
+    for parent in source.parents:
+        if _set_read_config_recursively(parent, **kwargs):
+            return True
+    return False
+
+
+class Input(input_base.Input):
     """A Module to generate input batches with `grain`."""
 
     @config_class
-    class Config(Module.Config):
+    class Config(input_base.Input.Config):
         """Configures Input.
 
         Attributes:
-            source: A `BuildDatasetFn` producing the source dataset. Can be a `grain.MapDataset` or
-                `grain.IterDataset`.
+            source: A BuildDatasetFn (or a config instantiating to one). The result dataset will
+                contain a stream of examples representing one epoch of the source dataset.
         """
 
         source: Required[ConfigOr[BuildDatasetFn]] = REQUIRED
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
-        cfg = self.config
+        cfg: Input.Config = self.config
         self._source = maybe_instantiate(cfg.source)
 
     @property
@@ -452,7 +626,11 @@ class Input(Module):
         return self._source
 
     def dataset(self) -> grain.IterDataset:
-        return maybe_to_iter_dataset(self._source())
-
-    def __iter__(self) -> grain.PyGrainDatasetIterator[utils.NestedTensor]:
-        return iter(self.dataset())
+        ds = self._source()
+        if "input_dispatcher" in self.children:
+            if not _set_read_config_recursively(ds, **self.input_dispatcher.feed_read_config()):
+                raise ValueError(
+                    f"Failed to set read config on {ds}. "
+                    f"Please make sure to call {shard_dataset.__name__} if using input dispatch."
+                )
+        return maybe_to_iter_dataset(ds)

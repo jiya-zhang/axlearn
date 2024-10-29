@@ -34,13 +34,7 @@ import jax.numpy as jnp
 
 # pytype: disable=import-error  # pylint: disable=import-error
 from jax import lax
-from jax._src.cudnn.fused_attention_stablehlo import (
-    MaskType,
-    _dot_product_attention,
-    _normalize_layout,
-    check_cudnn_version,
-)
-from jax._src.lib import cuda_versions
+from jax._src.cudnn.fused_attention_stablehlo import MaskType, dot_product_attention
 from jax.experimental import pallas as pl
 
 from axlearn.common.attention import NEG_INF
@@ -252,7 +246,7 @@ def flash_attention(
     if bias is not None:
         assert bias.ndim == 4
 
-        def bias_index_map(j, k):
+        def bias_index_map(_, j, k):
             return (j if bias.shape[0] != 1 else 0, k if bias.shape[1] != 1 else 0, 0, 0)
 
         bias_block_spec = pl.BlockSpec(bias_index_map, (None, None, seq_len, seq_len))
@@ -330,7 +324,7 @@ def _mha_forward(
     if bias is not None:
         assert bias.ndim == 4
 
-        def bias_index_map(j, k):
+        def bias_index_map(_, j, k):
             return (j if bias.shape[0] != 1 else 0, k if bias.shape[1] != 1 else 0, 0, 0)
 
         bias_block_spec = pl.BlockSpec(bias_index_map, (None, None, seq_len, seq_len))
@@ -590,6 +584,9 @@ def _mha_backward(
 
     # NOTE: temporarily removed the "xla" branch, which seems unused.
     if backward_pass_impl == "triton":
+        # We must shrink the block size for float32 inputs to avoid OOM during bwd pass.
+        if jnp.float32 in (q.dtype, k.dtype, v.dtype):
+            block_q = block_k = 64
         batch_size, seq_len, num_heads, head_dim = q.shape
         # Backward heuristics, using the same block size for block q and block k.
         block_q = min(block_q, seq_len)
@@ -611,6 +608,9 @@ def _mha_backward(
         if b is not None:
             assert b.ndim == 4
             b = jnp.moveaxis(b, -1, -2)
+            # We must shrink the block size for float32 inputs to avoid OOM during bwd pass.
+            if b.dtype == jnp.float32:
+                block_q = block_k = 64
 
             def bias_index_map(j, k):
                 return (j if b.shape[0] != 1 else 0, k if b.shape[1] != 1 else 0, 0, 0)
@@ -674,24 +674,6 @@ def _mha_backward(
 flash_attention.defvjp(_mha_forward, _mha_backward)
 
 
-def _check_local_compute_capability(cc: Any):
-    """Check if the local devices meet the required compute capability.
-
-    Args:
-        cc: Required compute capability.
-
-    Raises:
-        RuntimeError: cuDNN is not detected.
-        RuntimeError: compute capability does not match the target.
-    """
-    if cuda_versions is None:
-        raise RuntimeError("cuDNN is not detected.")
-    for i in range(jax.local_device_count()):
-        compute_cap = cuda_versions.cuda_compute_capability(i)
-        if compute_cap not in cc:
-            raise RuntimeError("Require compute capability in " + str(cc))
-
-
 # Interface to cuDNN's dot product attention.
 # TODO(kelvin-zou): Verify dropout rate functions.
 # TODO(kelvin-zou): Add support for segment IDs.
@@ -740,38 +722,19 @@ def cudnn_dot_product_attention(
 
     if qkv_layout != "BTNH":
         raise NotImplementedError(f"Unsupported qkv_layout: {qkv_layout}")
-    # Check if cuDNN is installed.
-    cudnn_version = check_cudnn_version()
-    # Support Ampere and Hopper only for now.
-    _check_local_compute_capability((80, 90))
-    mask_type = MaskType.NO_MASK if not causal else MaskType.CAUSAL
-    layout = _normalize_layout(qkv_layout)
 
-    has_bias = bias is not None
-    has_mask = mask is not None
-    has_dbias = False
-    variadic_args = (has_bias, has_mask, has_dbias)
-    if bias is None:
-        bias = jnp.zeros(0, dtype=query.dtype)
-    if mask is None:
-        mask = jnp.zeros(0, dtype=query.dtype)
-    q_seqlen = jnp.zeros(0, dtype=query.dtype)
-    kv_seqlen = jnp.zeros(0, dtype=query.dtype)
-    # pylint: disable-next=too-many-function-args
-    output = _dot_product_attention(
-        query,
-        key,
-        value,
-        bias,
-        mask,
-        q_seqlen,
-        kv_seqlen,
-        softmax_scale,
-        seed,
-        dropout_rate,
-        variadic_args,
-        mask_type,
-        layout.value,
-        cudnn_version,
+    mask_type = MaskType.NO_MASK if not causal else MaskType.CAUSAL
+
+    output = dot_product_attention(
+        query=query,
+        key=key,
+        value=value,
+        bias=bias,
+        mask=mask,
+        scale=softmax_scale,
+        seed=seed,
+        dropout_rate=dropout_rate,
+        mask_type=mask_type,
+        qkv_layout=qkv_layout,
     )
     return output

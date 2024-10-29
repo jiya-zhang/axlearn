@@ -314,7 +314,7 @@ class BaseTransformerLayer(BaseLayer):
         raise NotImplementedError(type(self))
 
 
-def make_causal_mask(seq_len: int) -> Tensor:
+def make_causal_biases(seq_len: int) -> Tensor:
     """Generates attention logit biases for causal masking.
 
     Args:
@@ -325,16 +325,32 @@ def make_causal_mask(seq_len: int) -> Tensor:
         0 otherwise.
     """
     # TODO(sneha): support batching
-    return _bool_to_bias(causal_mask(jnp.arange(seq_len)[:, None], jnp.arange(seq_len)[None, :]))
+    return bool_to_bias(causal_mask(jnp.arange(seq_len)[:, None], jnp.arange(seq_len)[None, :]))
 
 
-def _bool_to_bias(mask: Tensor) -> Tensor:
+def make_sliding_window_causal_biases(seq_len: int, sliding_window_size: int) -> Tensor:
+    """Generates attention logit biases for sliding window attention.
+
+    Args:
+        seq_len: Sequence length.
+
+    Returns:
+        A float tensor of shape [seq_len, seq_len] where the value at [i, j] = -inf
+        if i - j > sliding_window_size or i < j, 0 otherwise.
+    """
+    mask_fn = sliding_window_causal_mask(sliding_window_size)
+    return bool_to_bias(mask_fn(jnp.arange(seq_len)[:, None], jnp.arange(seq_len)[None, :]))
+
+
+def bool_to_bias(mask: Tensor) -> Tensor:
     """Converts a bool mask tensor to a bias mask tensor.
 
     Maps:
     0 -> -NEG_INF
     1 -> 0.
     """
+    if mask.dtype != jnp.bool:
+        raise ValueError("mask must be a Boolean tensor.")
     return (~mask) * NEG_INF
 
 
@@ -888,9 +904,14 @@ class BaseQKVLinear(BaseLayer):
             oh_indices = jax.nn.one_hot(time_step, target_len, dtype=k_proj.dtype)
             # [B, 1, 1, T] to broadcast.
             oh_indices = oh_indices[:, None, None, :]
-            # Ensure that we accumulate in original dtype.
-            new_k_proj = cached_key + (k_proj * oh_indices).astype(cached_key.dtype)
-            new_v_proj = cached_value + (v_proj * oh_indices).astype(cached_value.dtype)
+            negated_oh_indices = (1 - oh_indices).astype(cached_key.dtype)
+            # Ensure that we accumulate using the original dtype.
+            new_k_proj = (cached_key * negated_oh_indices) + (k_proj * oh_indices).astype(
+                cached_key.dtype
+            )
+            new_v_proj = (cached_value * negated_oh_indices) + (v_proj * oh_indices).astype(
+                cached_value.dtype
+            )
 
             # Move back to original [B, T, N, H] layout.
             k_proj = jnp.moveaxis(new_k_proj, -1, -3)
@@ -1621,6 +1642,30 @@ class MaskFn(Protocol):
         """
 
 
+def _composite_masks(op: Callable[[Tensor, Tensor], Tensor], *mask_fns: ConfigOr[MaskFn]):
+    if len(mask_fns) == 0:
+        raise RuntimeError(f"Input must not be empty: {mask_fns}")
+
+    def mask(query_position: Tensor, key_position: Tensor):
+        fns = [maybe_instantiate(arg) for arg in mask_fns]
+        result = fns[0](query_position, key_position)
+        for mask in fns[1:]:
+            result = op(result, mask(query_position, key_position))
+        return result
+
+    return mask
+
+
+def or_masks(*mask_fns: ConfigOr[MaskFn]) -> MaskFn:
+    """Returns a MaskFn that's the union of provided MaskFn's."""
+    return _composite_masks(jnp.logical_or, *mask_fns)
+
+
+def and_masks(*mask_fns: ConfigOr[MaskFn]) -> MaskFn:
+    """Returns a MaskFn that's the intersection of provided MaskFn's."""
+    return _composite_masks(jnp.logical_and, *mask_fns)
+
+
 def causal_mask(query_position: Tensor, key_position: Tensor) -> Tensor:
     """Returns the given entry of a causal attention mask.
 
@@ -1628,6 +1673,18 @@ def causal_mask(query_position: Tensor, key_position: Tensor) -> Tensor:
     See that and `MultiheadAttention.Config.mask`.
     """
     return query_position >= key_position
+
+
+def sliding_window_causal_mask(sliding_window_size: int):
+    """Returns a causal MaskFn for sliding window attentions of a given window size.
+
+    Implements the `MaskFn` protocol.
+    """
+
+    def mask(query_position: Tensor, key_position: Tensor):
+        return query_position - key_position <= sliding_window_size
+
+    return and_masks(causal_mask, mask)
 
 
 class MultiheadAttention(BaseLayer):
@@ -1781,8 +1838,6 @@ class MultiheadAttention(BaseLayer):
                 "key and value must be both None or both set, "
                 f"key:{type(key)}, value:{type(value)}"
             )
-        if self._mask_fn and (key is not None or value is not None):
-            raise ValueError("key and value are not expected when using an attention mask.")
         if kv_state is not None:
             if key is not None or value is not None:
                 raise ValueError("kv_state should not be specified together with key/value")
@@ -1824,19 +1879,22 @@ class MultiheadAttention(BaseLayer):
                     f"Invalid attention_logit_biases shape: {attention_logit_biases.shape}."
                 )
         if self._mask_fn is not None:
+            kv_len = k_proj.shape[1]
             if mode == ForwardMode.EXTEND_STEP:
-                seq_len = k_proj.shape[1]
+                # query_len is unused because extend_step assumes query to be length 1.
+                query_len = None
                 time_step = cached_states["i_proj"]["time_step"]
             else:
-                seq_len = q_proj.shape[1]
+                query_len = q_proj.shape[1]
                 time_step = None
-            mask = self._logit_biases_for_mask(mode=mode, seq_len=seq_len, time_step=time_step)
+            mask = self._logit_biases_for_mask(
+                mode=mode, kv_len=kv_len, query_len=query_len, time_step=time_step
+            )
             if mask is not None:
                 attention_logit_biases = apply_attention_logit_biases(
                     mask.astype(q_proj.dtype),
                     attention_logit_biases,
                 )
-
         context, probs = self._compute_attention(
             q_proj=q_proj,
             k_proj=k_proj,
@@ -1860,30 +1918,54 @@ class MultiheadAttention(BaseLayer):
         return dict(i_proj=i_proj_state), output
 
     def _logit_biases_for_mask(
-        self, *, mode: ForwardMode, seq_len: int, time_step: Optional[Tensor] = None
+        self,
+        *,
+        mode: ForwardMode,
+        kv_len: int,
+        query_len: Optional[int] = None,
+        time_step: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
         """Returns the configured attention mask in the form of logit biases.
 
         ... or None if the implementation of _compute_attention supports applying masks natively.
 
-        For (ForwardMode.FORWARD, ForwardMode.INIT_STATES), the mask can be broadcast to
-        [batch, num_heads, seq_len, seq_len].
+        Args:
+            mode: The forward propagation mode, chosen from
+                (ForwardMode.FORWARD, ForwardMode.INIT_STATES, ForwardMode.EXTEND_STEP).
+            kv_len: The sequence length. For (ForwardMode.INIT_STATES, ForwardMode.EXTEND_STEP),
+                this is equal to the KV cache size.
+            query_len: Only used for (ForwardMode.FORWARD, ForwardMode.INIT_STATES).
+                If set, this is the query length. Otherwise, it uses kv_len as the query length.
+                Must be None for ForwardMode.EXTEND_STEP.
+            time_step: Only used for (ForwardMode.EXTEND_STEP). A tensor of size [batch] denoting
+                the 0-indexed position of the current input token.
 
-        For ForwardMode.EXTEND_STEP, the mask can be broadcast to [batch, num_heads, 1, seq_len].
+        Returns:
+            For (ForwardMode.FORWARD, ForwardMode.INIT_STATES), a logit bias tensor that can be
+                broadcast to [batch, num_heads, query_len, kv_len].
+
+            For ForwardMode.EXTEND_STEP, a logit bias tensor that can be broadcast to
+                [batch, num_heads, 1, kv_len].
         """
-        kv_pos = jnp.arange(seq_len)
+        kv_pos = jnp.arange(kv_len)
+
         if mode in (ForwardMode.FORWARD, ForwardMode.INIT_STATES):
-            mask = self._mask_fn(kv_pos[:, None], kv_pos[None, :])[
-                None, None
-            ]  # Query and key have saem seq lengths.
+            if time_step is not None:
+                raise ValueError(
+                    "FORWARD or INIT_STATES modes do not expect `time_step` as an argument."
+                )
+            query_pos = jnp.arange(kv_len if query_len is None else query_len)
+            mask = self._mask_fn(query_pos[:, None], kv_pos[None, :])[None, None]
         elif mode == ForwardMode.EXTEND_STEP:
+            if query_len is not None:
+                raise ValueError("EXTEND_STEP mode does not expect `query_len` as an argument.")
             # [batch, 1, 1, kv_len].
             # Ex: for a causal mask, mask[b, :, :, kv_pos] = 0 if time_step[b] > kv_pos else 1.
             mask = self._mask_fn(time_step[:, None], kv_pos[None, :])
             mask = mask[:, None, None, :]
         else:
             raise ValueError(f"Unrecognized mode {mode}.")
-        mask = _bool_to_bias(mask)
+        mask = bool_to_bias(mask)
         return mask
 
     def _compute_attention(
@@ -1910,6 +1992,10 @@ class MultiheadAttention(BaseLayer):
         """
         # Merge segment ids into attention_logit_biases.
         if segment_ids is not None:
+            if q_proj.shape[1] != k_proj.shape[1]:
+                raise ValueError(
+                    "segment_ids is only supported for query and key with identical lengths."
+                )
             attention_logit_biases = apply_attention_logit_biases(
                 make_segment_mask(source_segments=segment_ids, target_segments=segment_ids),
                 attention_logit_biases,
@@ -2010,6 +2096,8 @@ class MultiheadAttention(BaseLayer):
         *,
         time_step: Tensor,
         query: Tensor,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
         kv_state: Optional[KVState] = None,
         attention_logit_biases: Optional[Tensor],
         return_aux: Optional[set[str]] = None,
@@ -2022,9 +2110,15 @@ class MultiheadAttention(BaseLayer):
         Args:
             time_step: A Tensor of shape [B]. Each value is an index into the length dimension
                 indicating where decoding will start from.
-            query: Tensor of shape [B, T, D] corresponding to query vector up to `time_step`. For
-                batch index `i`, only `query[i, :time_step[i], ...]` will affect subsequent
-                decoding.
+            query: Tensor of shape [B, T, D] corresponding to query projection input vector
+                up to `time_step`. For batch index `i`, only `query[i, :time_step[i], ...]`
+                will affect subsequent decoding.
+            key: Same description as `query`, but for the key projection input vector.
+                Key and value have to both be tensors or both be None.
+                If they are tensors, key and value are used as the unique input to the
+                input projection. Otherwise, query is used as the key and value input.
+            value: Same description as `query`, but for the value projection input vector.
+                See the above comment for `key` for additional constraints.
             kv_state: An optional KVState.
             attention_logit_biases: See ``On attention logit biases`` in the file comments.
             return_aux: See comments on `Output`.
@@ -2037,6 +2131,8 @@ class MultiheadAttention(BaseLayer):
         return self._forward_for_mode(
             mode=ForwardMode.INIT_STATES,
             query=query,
+            key=key,
+            value=value,
             cached_states=dict(i_proj=time_step),
             kv_state=kv_state,
             attention_logit_biases=attention_logit_biases,
@@ -2048,6 +2144,8 @@ class MultiheadAttention(BaseLayer):
         cached_states: NestedTensor,
         query: Tensor,
         *,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
         kv_state: Optional[KVState] = None,
         attention_logit_biases: Optional[Tensor],
         return_aux: Optional[set[str]] = None,
@@ -2062,7 +2160,15 @@ class MultiheadAttention(BaseLayer):
             cached_states: A `NestedTensor` object containing tensors which are the results of
                 previous attentions, and index used for fast decoding. Contains "key" and "value" of
                 shape [B, N, H, T], and a Tensor "time_step" of shape [B].
-            query: Tensor of shape [B, 1, D] corresponding to query vector at "time_step" indices.
+            query: Tensor of shape [B, 1, D] corresponding to query projection input vector
+                at "time_step" indices.
+            key: Tensor of shape [B, 1, D] corresponding to key projection input vector at
+                "time_step" indices. Key and value have to both be tensors or both be None.
+                If they are tensors, key and value are used as the unique input to the
+                input projection. Otherwise, query is used as the key and value input.
+            value: Tensor of shape [B, 1, D] corresponding to value projection input vector
+                at "time_step" indices. See the above comment for `key` for additional
+                constraints.
             kv_state: An optional KVState.
             attention_logit_biases: See ``On attention logit biases`` in the file comments.
                 Additionally, target_length is expected to be 1 since this is per time step.
@@ -2078,6 +2184,8 @@ class MultiheadAttention(BaseLayer):
         return self._forward_for_mode(
             mode=ForwardMode.EXTEND_STEP,
             query=query,
+            key=key,
+            value=value,
             cached_states=cached_states,
             kv_state=kv_state,
             attention_logit_biases=attention_logit_biases,
@@ -2171,6 +2279,10 @@ class SigmoidAttention(MultiheadAttention):
         """See `MultiheadAttention._compute_attention` for details."""
         # Merge segment ids into attention_logit_biases.
         if segment_ids is not None:
+            if q_proj.shape[1] != k_proj.shape[1]:
+                raise ValueError(
+                    "segment_ids is only supported for query and key with identical lengths."
+                )
             attention_logit_biases = apply_attention_logit_biases(
                 make_segment_mask(source_segments=segment_ids, target_segments=segment_ids),
                 attention_logit_biases,

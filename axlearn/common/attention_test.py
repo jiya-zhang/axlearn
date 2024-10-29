@@ -44,6 +44,8 @@ from axlearn.common.attention import (
     BaseStackedTransformerLayer,
     BaseTransformerLayer,
     BottleNeckAdapterTransformerLayer,
+    ForwardMode,
+    FusedGroupedQKVLinear,
     FusedQKVLinear,
     KVState,
     LearnedPositionalEmbedding,
@@ -65,13 +67,17 @@ from axlearn.common.attention import (
     _next_power_of_two,
     apply_attention_logit_biases,
     apply_rotary_position_embeddings,
+    bool_to_bias,
     build_remat_spec,
+    causal_mask,
     compute_padding_biases,
-    make_causal_mask,
+    make_causal_biases,
+    make_sliding_window_causal_biases,
     rel_pos_to_abs_pos,
     scaled_hidden_dim,
     set_double_shard_weights_config,
     sinusoidal_positional_embeddings,
+    sliding_window_causal_mask,
     xl_attention_logits,
 )
 from axlearn.common.base_layer import (
@@ -124,6 +130,26 @@ def all_subsets(given_set):
     )
 
 
+def make_index_position_biases(query_len: int, kv_len: int) -> Tensor:
+    """Generates attention logit biases where query indices cannot attend to larger key indices.
+
+    Args:
+        query_len: The sequence length.
+        kv_len: The key's length.
+
+    Returns:
+        A float tensor of shape [query_len, kv_len] where the value at
+        [i, j] = -inf if i < j, 0 otherwise.
+    """
+
+    return bool_to_bias(
+        causal_mask(
+            jnp.arange(query_len)[:, None],
+            jnp.arange(kv_len)[None, :],
+        )
+    )
+
+
 def _random_mask(prng_key, tgt_len, src_len):
     """Returns a float mask of shape [tgt_len, src_len]."""
     key1, key2 = jax.random.split(prng_key)
@@ -142,7 +168,7 @@ class MaskTest(absltest.TestCase):
 
     def test_causal_mask(self):
         expected = jnp.array([[0.0, NEG_INF, NEG_INF], [0.0, 0.0, NEG_INF], [0.0, 0.0, 0.0]])
-        actual = attention.make_causal_mask(3)
+        actual = attention.make_causal_biases(3)
         self.assertTrue(jnp.all(actual <= expected))
 
     def test_segment_mask(self):
@@ -651,7 +677,9 @@ class ALiBiAttentionLogitBiasLayerTest(TestCase):
                 # Construct the ref_alibi for the current segment.
                 # [num_heads, segment_len].
                 ref_alibi = self.ref_alibi_implementation(1, num_heads, segment_len).squeeze(0)
-                ref_causal_mask = jnp.repeat(make_causal_mask(segment_len)[None, ...], num_heads, 0)
+                ref_causal_mask = jnp.repeat(
+                    make_causal_biases(segment_len)[None, ...], num_heads, 0
+                )
                 ref_alibi = attention.apply_attention_logit_biases(ref_alibi, ref_causal_mask)
                 ref_alibi = jax.nn.softmax(ref_alibi, axis=-1)
 
@@ -1399,6 +1427,67 @@ class QKVLinearTest(TestCase):
                 # Check that the outputs are close for all pairs.
                 self.assertNestedAllClose(outputs[layer_a], outputs[layer_b])
 
+    @parameterized.parameters(
+        attention.QKVLinear,
+        attention.FusedQKVLinear,
+        attention.GroupedQKVLinear,
+        attention.FusedGroupedQKVLinear,
+        attention.RoFormerQKVLinear,
+    )
+    def test_repeated_extend_step(self, layer_cls: type[attention.BaseQKVLinear]):
+        """Tests that calling QKVLinear.extend_step() multiple times with the
+        same time_step results in the same output."""
+
+        model_dim = 8
+        num_heads = 2
+        per_head_dim = model_dim // num_heads
+        layer_kwargs = dict(
+            query_dim=model_dim,
+            key_dim=model_dim,
+            value_dim=model_dim,
+            num_heads=num_heads,
+            per_head_dim=per_head_dim,
+        )
+        cfg = layer_cls.default_config().set(**layer_kwargs)
+        maybe_set_config(cfg, num_kv_heads=num_heads, rotary_value=False)
+        layer = cfg.set(name="test").instantiate(parent=None)
+
+        # Construct base layer state.
+        layer_state = layer.initialize_parameters_recursively(jax.random.PRNGKey(0))
+
+        # Construct test inputs.
+        batch_size, tgt_len = 2, 4
+        query = jax.random.uniform(jax.random.PRNGKey(0), [batch_size, tgt_len, model_dim])
+
+        extend_step_state, _ = F(
+            layer,
+            state=layer_state,
+            is_training=False,
+            prng_key=jax.random.PRNGKey(456),
+            inputs=dict(target_batch_size=batch_size, target_max_len=tgt_len),
+            method="init_states",
+        )
+        for t in range(tgt_len):
+            (first_call_state, first_call_output), _ = F(
+                layer,
+                state=layer_state,
+                is_training=False,
+                prng_key=jax.random.PRNGKey(456),
+                inputs=dict(cached_states=extend_step_state, query=query[:, t : t + 1]),
+                method="extend_step",
+            )
+            # Rewind the time_step.
+            first_call_state["time_step"] -= 1
+            (extend_step_state, second_call_output), _ = F(
+                layer,
+                state=layer_state,
+                is_training=False,
+                prng_key=jax.random.PRNGKey(456),
+                inputs=dict(cached_states=first_call_state, query=query[:, t : t + 1]),
+                method="extend_step",
+            )
+            self.assertNestedAllClose(first_call_output, second_call_output)
+
     @parameterized.parameters(jnp.float32, jnp.float16, jnp.bfloat16)
     def test_dtypes_inherited_from_parent(self, dtype: jnp.dtype):
         """Test that the dtype is inherited from the parent.
@@ -2009,16 +2098,24 @@ class MultiheadAttentionTest(TestCase):
             ),
         ),
         attention_logit_biases_fn=(
-            lambda seq_len: None,
-            lambda seq_len: _random_mask(jax.random.PRNGKey(1), seq_len, seq_len),
+            lambda query_len, kv_len: None,
+            lambda query_len, kv_len: _random_mask(jax.random.PRNGKey(1), query_len, kv_len),
         ),
+        kv_length_multiplier=(0.5, 1, 2),
     )
     def test_causal(
         self,
         base_cfg: attention.MultiheadAttention.Config,
-        attention_logit_biases_fn: Callable[[int], Tensor],
+        attention_logit_biases_fn: Callable[[int, int], Tensor],
+        kv_length_multiplier: float,
     ):
         """Tests that base_cfg(causal=True) is equivalent to applying a causal mask."""
+        if kv_length_multiplier != 1 and isinstance(
+            base_cfg.input_linear,
+            (FusedGroupedQKVLinear.Config, RoFormerQKVLinear.Config, FusedQKVLinear.Config),
+        ):
+            pytest.skip(reason="Incompatible test setting that does not need testing.")
+
         model_dim = 16
         num_heads = 4
         ref_cfg = base_cfg.clone(
@@ -2035,20 +2132,180 @@ class MultiheadAttentionTest(TestCase):
         test_cfg = ref_cfg.clone(causal=True)
         test_layer = test_cfg.instantiate(parent=None)
 
+        batch_size, query_len = 2, 4
+        query = jnp.zeros([batch_size, query_len, model_dim], dtype=jnp.float32)
+        outputs = []
+
+        for layer in (ref_layer, test_layer):
+            inputs = dict(query=query)
+            kv_len = int(kv_length_multiplier * query_len)
+            if kv_length_multiplier < 1:
+                inputs["key"] = query[:, :kv_len]
+                inputs["value"] = query[:, :kv_len]
+            elif kv_length_multiplier > 1:
+                inputs["key"] = jnp.tile(query, [1, int(kv_length_multiplier), 1])
+                inputs["value"] = jnp.tile(query, [1, int(kv_length_multiplier), 1])
+
+            attention_logit_biases = attention_logit_biases_fn(inputs["query"].shape[1], kv_len)
+            if layer is ref_layer:
+                # Apply causal mask on top of the logit biases for `ref_layer`.
+                causal_biases = make_index_position_biases(inputs["query"].shape[1], kv_len=kv_len)
+                if attention_logit_biases is None:
+                    attention_logit_biases = causal_biases
+                else:
+                    attention_logit_biases = apply_attention_logit_biases(
+                        attention_logit_biases, causal_biases
+                    )
+            inputs["attention_logit_biases"] = attention_logit_biases
+
+            layer_outputs, _ = F(
+                layer,
+                state=layer_params,
+                is_training=True,
+                prng_key=jax.random.PRNGKey(456),
+                inputs=inputs,
+            )
+            outputs.append(layer_outputs)
+        # The outputs are equivalent.
+        self.assertNestedAllClose(outputs[0], outputs[1])
+
+    def test_logit_biases_for_mask(self):
+        model_dim = 16
+        num_heads = 4
+        cfg = attention.MultiheadAttention.default_config().set(
+            name="test",
+            query_dim=model_dim,
+            key_dim=model_dim,
+            value_dim=model_dim,
+            num_heads=num_heads,
+            mask=causal_mask,
+        )
+        layer = cfg.instantiate(parent=None)
+        layer_params = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
+
+        inputs = dict(mode=ForwardMode.FORWARD, kv_len=3, query_len=2)
+        layer_outputs, _ = F(
+            layer,
+            state=layer_params,
+            is_training=True,
+            prng_key=jax.random.PRNGKey(456),
+            inputs=inputs,
+            method="_logit_biases_for_mask",
+        )
+        self.assertNestedAllClose(
+            layer_outputs,
+            bool_to_bias(jnp.array([[1, 0, 0], [1, 1, 0]], dtype=jnp.bool))[None, None],
+        )
+
+        inputs = dict(mode=ForwardMode.FORWARD, kv_len=3, query_len=2, time_step=jnp.array([3, 4]))
+        with self.assertRaises(ValueError) as cm:
+            layer_outputs, _ = F(
+                layer,
+                state=layer_params,
+                is_training=True,
+                prng_key=jax.random.PRNGKey(456),
+                inputs=inputs,
+                method="_logit_biases_for_mask",
+            )
+        self.assertTrue(isinstance(cm.exception, ValueError))
+
+        inputs = dict(
+            mode=ForwardMode.EXTEND_STEP, kv_len=3, query_len=2, time_step=jnp.array([3, 4])
+        )
+        with self.assertRaises(ValueError) as cm:
+            F(
+                layer,
+                state=layer_params,
+                is_training=True,
+                prng_key=jax.random.PRNGKey(456),
+                inputs=inputs,
+                method="_logit_biases_for_mask",
+            )
+        self.assertTrue(isinstance(cm.exception, ValueError))
+
+        inputs = dict(mode=ForwardMode.EXTEND_STEP, kv_len=4, time_step=jnp.array([1, 2]))
+        layer_outputs, _ = F(
+            layer,
+            state=layer_params,
+            is_training=True,
+            prng_key=jax.random.PRNGKey(456),
+            inputs=inputs,
+            method="_logit_biases_for_mask",
+        )
+        self.assertNestedAllClose(
+            layer_outputs,
+            bool_to_bias(jnp.array([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=jnp.bool))[:, None, None, :],
+        )
+
+    @parameterized.product(
+        base_cfg=(
+            attention.MultiheadAttention.default_config(),
+            attention.GroupedQueryAttention.default_config().set(
+                input_linear=attention.GroupedQKVLinear.default_config().set(num_kv_heads=2)
+            ),
+            attention.GroupedQueryAttention.default_config().set(
+                input_linear=attention.FusedGroupedQKVLinear.default_config().set(num_kv_heads=2)
+            ),
+            attention.GroupedQueryAttention.default_config().set(
+                input_linear=attention.RoFormerQKVLinear.default_config().set(rotary_value=False)
+            ),
+            attention.SigmoidAttention.default_config().set(
+                input_linear=attention.RoFormerQKVLinear.default_config().set(rotary_value=False),
+                seq_len=4,
+            ),
+            attention.SigmoidAttention.default_config().set(
+                # Used in ALiBi position encoding.
+                input_linear=FusedQKVLinear.default_config(),
+                seq_len=4,
+            ),
+        ),
+        attention_logit_biases_fn=(
+            lambda seq_len: None,
+            lambda seq_len: _random_mask(jax.random.PRNGKey(1), seq_len, seq_len),
+        ),
+    )
+    def test_sliding_window(
+        self,
+        base_cfg: attention.MultiheadAttention.Config,
+        attention_logit_biases_fn: Callable[[int], Tensor],
+    ):
+        """
+        Tests that base_cfg with sliding window causal mask fns is equivalent to applying a
+        causal sliding window mask.
+        """
+        model_dim = 16
+        num_heads = 4
+        ref_cfg = base_cfg.clone(
+            name="test",
+            query_dim=model_dim,
+            key_dim=model_dim,
+            value_dim=model_dim,
+            num_heads=num_heads,
+        )
+        self.assertFalse(ref_cfg.causal)
+        ref_layer = ref_cfg.instantiate(parent=None)
+        layer_params = ref_layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
+
+        sliding_window_size = 2
+        test_cfg = ref_cfg.clone(
+            causal=False,
+            mask=config_for_function(sliding_window_causal_mask).set(
+                sliding_window_size=sliding_window_size
+            ),
+        )
+        test_layer = test_cfg.instantiate(parent=None)
+
         batch_size, seq_len = 2, 4
         query = jnp.zeros([batch_size, seq_len, model_dim], dtype=jnp.float32)
         outputs = []
         for layer in (ref_layer, test_layer):
             attention_logit_biases = attention_logit_biases_fn(seq_len)
             if layer is ref_layer:
-                # Apply causal mask on top of the logit biases for `ref_layer`.
-                causal_mask = make_causal_mask(seq_len)
-                if attention_logit_biases is None:
-                    attention_logit_biases = causal_mask
-                else:
-                    attention_logit_biases = apply_attention_logit_biases(
-                        attention_logit_biases, causal_mask
-                    )
+                # Apply causal and sliding window mask on top of the logit biases for `ref_layer`.
+                attention_logit_biases = apply_attention_logit_biases(
+                    make_sliding_window_causal_biases(seq_len, sliding_window_size),
+                    attention_logit_biases,
+                )
             inputs = dict(query=query, attention_logit_biases=attention_logit_biases)
             layer_outputs, _ = F(
                 layer,
@@ -2150,7 +2407,7 @@ class MultiheadAttentionTest(TestCase):
             ),
             key=None,
             value=None,
-            attention_logit_biases=attention.make_causal_mask(tgt_len),
+            attention_logit_biases=attention.make_causal_biases(tgt_len),
         )
         # Get outputs.
         forward_key = jax.random.PRNGKey(456)
@@ -2209,8 +2466,10 @@ class MultiheadAttentionTest(TestCase):
                 ),
             )
         else:
-            key = value = query
-        attention_logit_biases = attention.make_causal_mask(tgt_len)
+            # Make key and value distinct from query. Otherwise, it is equivalent
+            # to the query only case.
+            key = value = query + 0.1
+        attention_logit_biases = attention.make_causal_biases(tgt_len)
         return_aux = {"probs"}
         inputs = dict(
             query=query,
@@ -2243,6 +2502,10 @@ class MultiheadAttentionTest(TestCase):
         decoder_probs = jnp.zeros(shape=[tgt_len, batch_size, num_heads, tgt_len])
         for t in range(tgt_len):
             inputs["query"] = jnp.expand_dims(query[:, t, :], axis=1)
+            if key is not None:
+                inputs["key"] = jnp.expand_dims(key[:, t, :], axis=1)
+            if value is not None:
+                inputs["value"] = jnp.expand_dims(value[:, t, :], axis=1)
             inputs["attention_logit_biases"] = attention_logit_biases[
                 jnp.newaxis, jnp.newaxis, t, :
             ]
@@ -2358,7 +2621,13 @@ class MultiheadAttentionTest(TestCase):
         query = jax.random.normal(
             jax.random.PRNGKey(123), [batch_size, tgt_len, model_dim], dtype=dtype
         )
-        attention_logit_biases = attention.make_causal_mask(tgt_len)
+        if attention_cfg.klass == attention.GroupedQueryAttention:
+            key = value = None
+        else:
+            # Make key and value distinct from query. Otherwise, it is equivalent
+            # to the query only case.
+            key = value = query + 0.1
+        attention_logit_biases = attention.make_causal_biases(tgt_len)
         return_aux = {"probs"}
 
         forward_outputs, _ = F(
@@ -2367,7 +2636,11 @@ class MultiheadAttentionTest(TestCase):
             is_training=False,
             prng_key=jax.random.PRNGKey(456),
             inputs=dict(
-                query=query, attention_logit_biases=attention_logit_biases, return_aux=return_aux
+                query=query,
+                key=key,
+                value=value,
+                attention_logit_biases=attention_logit_biases,
+                return_aux=return_aux,
             ),
         )
 
@@ -2380,6 +2653,8 @@ class MultiheadAttentionTest(TestCase):
             inputs=dict(
                 time_step=time_step,
                 query=query,
+                key=key,
+                value=value,
                 attention_logit_biases=attention_logit_biases,
                 return_aux=return_aux,
             ),
@@ -2423,6 +2698,13 @@ class MultiheadAttentionTest(TestCase):
             inputs["query"] = jnp.take_along_axis(
                 query, time_step[:, None, None], axis=1, mode="clip"
             )
+            if key is not None:
+                inputs["key"] = jnp.take_along_axis(
+                    key, time_step[:, None, None], axis=1, mode="clip"
+                )
+                inputs["value"] = jnp.take_along_axis(
+                    value, time_step[:, None, None], axis=1, mode="clip"
+                )
             # [batch=1, tgt_len=1, tgt_len].
             inputs["attention_logit_biases"] = jnp.take_along_axis(
                 attention_logit_biases[None, :, :], time_step[:, None, None], axis=1, mode="clip"
@@ -2686,7 +2968,7 @@ class MultiheadAttentionTest(TestCase):
             q_proj=jnp.full(qkv_shape, fill_value=qkv_value),
             k_proj=jnp.full(qkv_shape, fill_value=qkv_value),
             v_proj=jnp.full(qkv_shape, fill_value=qkv_value),
-            attention_logit_biases=attention.make_causal_mask(seq_len),
+            attention_logit_biases=attention.make_causal_biases(seq_len),
         )
 
         # Get outputs.
@@ -2704,8 +2986,8 @@ class MultiheadAttentionTest(TestCase):
         output_shape = [batch_size, num_heads, seq_len, seq_len]
         indexes = jnp.arange(seq_len)
         # Zeros outside of the causal triangle.
-        causal_mask = jax.lax.ge(indexes[:, None], indexes[None, :])
-        expected_output = jnp.full(output_shape, fill_value=expected_value) * causal_mask
+        causal_biases = jax.lax.ge(indexes[:, None], indexes[None, :])
+        expected_output = jnp.full(output_shape, fill_value=expected_value) * causal_biases
 
         self.assertNestedAllClose(probs, expected_output)
 
@@ -3380,7 +3662,7 @@ class ParallelTransformerTest(TestCase):
         batch_size, tgt_len = 2, 6
         rng = np.random.default_rng(seed=123)
         target = rng.random([batch_size, tgt_len, model_dim], dtype=np.float32)
-        mask = attention.make_causal_mask(tgt_len)
+        mask = attention.make_causal_biases(tgt_len)
         mask = jnp.tile(mask[None, None, :, :], (batch_size, num_heads, 1, 1))
         layer_outputs, _ = F(
             layer,
@@ -3583,7 +3865,7 @@ class StackedTransformerTest(BaseTransformerTest):
         target = jax.random.normal(jax.random.PRNGKey(123), [batch_size, tgt_len, model_dim])
         source = jax.random.normal(jax.random.PRNGKey(456), [batch_size, src_len, model_dim * 2])
 
-        self_attention_logit_biases = attention.make_causal_mask(tgt_len)
+        self_attention_logit_biases = attention.make_causal_biases(tgt_len)
         cross_attention_logit_biases = (
             jnp.array(np.random.randint(0, 2, [tgt_len, src_len])) * NEG_INF
         )
@@ -3707,7 +3989,7 @@ class StackedTransformerTest(BaseTransformerTest):
         target = jax.random.normal(jax.random.PRNGKey(123), [batch_size, tgt_len, model_dim])
         source = jax.random.normal(jax.random.PRNGKey(456), [batch_size, src_len, model_dim * 2])
 
-        self_attention_logit_biases = attention.make_causal_mask(tgt_len)
+        self_attention_logit_biases = attention.make_causal_biases(tgt_len)
         cross_attention_logit_biases = (
             jnp.array(np.random.randint(0, 2, [tgt_len, src_len])) * NEG_INF
         )
@@ -4699,7 +4981,7 @@ class BottleNeckAdapterTransformerLayerTest(TestCase):
         state = adapter.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(0))
 
         data = jax.random.normal(jax.random.PRNGKey(1), [batch_size, tgt_len, model_dim])
-        self_attention_logit_biases = attention.make_causal_mask(tgt_len)
+        self_attention_logit_biases = attention.make_causal_biases(tgt_len)
 
         outputs, _ = F(
             adapter,
