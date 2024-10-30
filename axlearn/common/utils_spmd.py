@@ -3,6 +3,7 @@
 """SPMD related utils."""
 
 import logging
+import time
 from typing import Optional
 import orbax.checkpoint as ocp
 
