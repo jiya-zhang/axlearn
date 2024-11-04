@@ -499,6 +499,15 @@ class TPUGKEJob(GKEJob):
             for mount in cfg.host_mounts:
                 self._maybe_add_volume_mount(volume_mounts, spec=mount)
 
+        # Add ramdisk volume mount to container
+        # TODO: Currently the mount path is always "/cache", this should be aligned with user-defined local_checkpoint_dir
+        volume_mounts.append(
+            dict(
+                mountPath="/cache",
+                name="ramdisk",
+            )
+        )
+
         env_vars = {**cfg.env_vars}
         if cfg.enable_tpu_ici_resiliency is not None:
             env_vars["ENABLE_ICI_RESILIENCY"] = str(cfg.enable_tpu_ici_resiliency).lower()
@@ -631,6 +640,16 @@ class TPUGKEJob(GKEJob):
                     )
                 )
 
+        # Add ramdisk volume to pod
+        volumes.append(
+            dict(
+                name="ramdisk",
+                csi=dict(
+                    driver="phase1-checkpoint.csi.storage.gke.io"
+                ),
+            )
+        )
+
         # If running from bastion, a scheduling tier will be specified in env.
         # Tier "0" corresponds to reserved; otherwise we use preemptible.
         tier = os.environ.get("BASTION_TIER", None)
@@ -682,7 +701,7 @@ class TPUGKEJob(GKEJob):
                     # the original jobset attempts to restart (node pool conflict). This is more
                     # reliable at the moment but doesn't take advantage of node pool sharing. GCP is
                     # working on a fix.
-                    "provisioner-nodepool-id": cfg.name,
+                    # "provisioner-nodepool-id": cfg.name,
                 }
             )
 

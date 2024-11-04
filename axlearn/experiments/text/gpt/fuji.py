@@ -152,10 +152,10 @@ def get_trainer_kwargs(
             max_sequence_length=64,
             train_batch_size=32,
             eval_batch_size=32,
-            max_step=3000,
-            eval_every_n_steps=1500,
-            save_every_n_steps=500,
-            mesh_shape=mesh_shape_from_axes(data=-1),
+            max_step=800000,
+            eval_every_n_steps=800000,
+            save_every_n_steps=800000,
+            mesh_shape=mesh_shape_from_axes(data=2, fsdp=-1),
         )
     elif model_size == "1B":
         trainer_kwargs = dict(
@@ -206,9 +206,10 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
+            train_batch_size=8,
+            eval_batch_size=8,
             max_step=max_step,
-            mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
+            mesh_shape=mesh_shape_from_axes(data=2, fsdp=-1),
             mesh_rules=(
                 # Step time:
                 # v1 on tpu-v4-1024 (512 chips):            3.03s

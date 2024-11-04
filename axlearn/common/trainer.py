@@ -272,8 +272,7 @@ class SpmdTrainer(Module):
             self._add_child("summary_writer", cfg.summary_writer)
             self._add_child("model", cfg.model)
             self._add_child("learner", cfg.learner)
-            cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
-            self._add_child("checkpointer", cfg.checkpointer)
+
             if cfg.init_state_builder is not None:
                 self._add_child("init_state_builder", cfg.init_state_builder)
 
@@ -293,6 +292,12 @@ class SpmdTrainer(Module):
                 model=self._model_param_specs,
                 learner=self._learner_state_partition_specs,
             )
+            cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
+            cfg.checkpointer.mesh_shape = cfg.mesh_shape
+            cfg.checkpointer.mesh_axis_names = cfg.mesh_axis_names
+            cfg.checkpointer.abstract_state = self._trainer_state_specs.model
+            self._add_child("checkpointer", cfg.checkpointer)
+
             self._trainer_state_partition_specs = jax.tree.map(
                 lambda spec: spec.mesh_axes, self._trainer_state_specs
             )
@@ -742,7 +747,9 @@ class SpmdTrainer(Module):
         cfg = self.config
 
         # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
+        logging.info(f"MAGGIEJZ: prepare training. Self.step before restoring:{self.step}")
         self.restore_checkpoint(restore_step=None)
+        logging.info(f"MAGGIEJZ: prepare training. Self.step after restoring:{self.step}")
 
         if self.step is None:
             # If we didn't restore from checkpoint, attempt to build initial state according
@@ -795,12 +802,14 @@ class SpmdTrainer(Module):
             restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
+                logging.info(f"MAGGIEJZ: SPMD trainer restore_checkpoint. Trying to restore...")
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
                         ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
                     ),
                 )
+                logging.info(f"MAGGIEJZ: SPMD trainer restore_checkpoint. Restored step:{step}")
                 if step is not None:
                     self.vlog(
                         0,
@@ -829,6 +838,7 @@ class SpmdTrainer(Module):
                         step,
                         restore_input_iter,
                     )
+            logging.info(f"MAGGIEJZ: SPMD trainer restore_checkpoint. Restored step 2:{step}")
             if step is not None:
                 self._step = step
                 self._trainer_state = TrainerState(
