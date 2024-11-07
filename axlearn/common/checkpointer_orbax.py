@@ -54,8 +54,6 @@ from axlearn.common.checkpointer import (
 from axlearn.common.config import REQUIRED, Required, config_class
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
-import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
-from orbax.checkpoint._src.metadata import value as metadata
 
 try:
     # The import also registers the checkpoint handlers.
