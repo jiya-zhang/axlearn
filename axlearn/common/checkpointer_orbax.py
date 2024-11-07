@@ -34,6 +34,7 @@ from axlearn.common.config import config_class
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
+from orbax.checkpoint._src.metadata import value as metadata
 
 try:
     # The import also registers the checkpoint handlers.
@@ -97,8 +98,8 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
 
     async def metadata(
         self, infos: Sequence[ocp.type_handlers.ParamInfo]
-    ) -> Sequence[ocp.metadata.Metadata]:
-        return [ocp.metadata.Metadata(name=info.name, directory=info.path) for info in infos]
+    ) -> Sequence[metadata.Metadata]:
+        return [metadata.Metadata(name=info.name, directory=info.path) for info in infos]
 
 
 ocp.type_handlers.register_type_handler(tf.data.Iterator, _TfIteratorHandler(), override=True)
@@ -144,8 +145,8 @@ if _GRAIN_INSTALLED:
 
         async def metadata(
             self, infos: Sequence[ocp.type_handlers.ParamInfo]
-        ) -> Sequence[ocp.metadata.Metadata]:
-            return [ocp.metadata.Metadata(name=info.name, directory=info.path) for info in infos]
+        ) -> Sequence[metadata.Metadata]:
+            return [metadata.Metadata(name=info.name, directory=info.path) for info in infos]
 
     ocp.type_handlers.register_type_handler(
         grain.DatasetIterator, _GrainDatasetIteratorHandler(), override=True
@@ -385,9 +386,9 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         validation_type: CheckpointValidationType = CheckpointValidationType.EXACT
         async_timeout_secs: int = 300
         local_checkpoint_dir: Optional[str] = None
-        local_save_interval_steps: Optional[int] = 2000
+        local_save_interval_steps: Optional[int] = 500
         # TODO: persistent_save_interval_steps should align with trainer_config's setting
-        persistent_save_interval_steps: Optional[int] = 800000
+        persistent_save_interval_steps: Optional[int] = 1500
         # The following configs are required for instantiating an Orbax Emergency Checkpointer
         mesh_shape: Optional[Any] = None
         mesh_axis_names: Optional[Any] = None
@@ -404,8 +405,8 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         cfg: OrbaxEmergencyCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
 
-        if cfg.mesh_shape is None or cfg.mesh_axis_names is None:
-            raise ValueError("Orbax Emergency Checkpointer's mesh shape/axis names cannot be empty.")
+        if cfg.mesh_shape is None or cfg.mesh_axis_names is None or cfg.abstract_state is None:
+            raise ValueError("Orbax Emergency Checkpointer requires mesh shape, axis names, and abstract state.")
 
         devices = utils.create_device_mesh(mesh_shape=cfg.mesh_shape)
         global_mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
@@ -451,13 +452,17 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             async_options=ocp.options.AsyncOptions(timeout_secs=cfg.async_timeout_secs)
         )
 
+        shape_dtypes, tree_defs = jax.tree.flatten(cfg.abstract_state._asdict())
+        logging.info(f"MAGGIEJZ DEBUG: abstract_state: {cfg.abstract_state._asdict()}")
+        logging.info(f"MAGGIEJZ DEBUG: Shape_dtypes: {shape_dtypes}")
+        logging.info(f"MAGGIEJZ DEBUG: tree_defs: {tree_defs}")
+
         self._manager = emergency_checkpoint_manager.CheckpointManager(
             local_directory=cfg.local_checkpoint_dir,
             persistent_directory=cfg.dir,
             global_mesh=global_mesh,
-            abstract_state=cfg.abstract_state,
-            options=options,
-            local_state_handler=emergency_checkpoint_manager.local_checkpoint_handler(),
+            abstract_state=cfg.abstract_state._asdict(),
+            options=options
         )
 
     # pylint: disable-next=redefined-builtin
@@ -481,7 +486,6 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
             # We use a simple PyTree to save current state
             self._manager.save(
                 step=step,
-                # The input iterator is saved as part of `save_tf_savables`.
                 args=ocp.args.PyTreeSave(state),
             )
             # Exit early after pre-emption, equivalent to sys.exit():
@@ -502,35 +506,44 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
 
         cfg: OrbaxCheckpointer.Config = self.config
 
-        def _restore_args(x: Any) -> ocp.RestoreArgs:
-            if isinstance(x, (Tensor, TensorSpec)):
-                return ocp.checkpoint_utils.construct_restore_args(
-                    jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding)
-                )
-            elif isinstance(x, tf.data.Iterator):
-                return _TfIteratorHandler.RestoreArgs(item=x)
-            else:
-                return None
-
-        restore_args = jax.tree_util.tree_map(_restore_args, state)
-
-        try:
-            restored_state = self._manager.restore(
-                step,
-                args=ocp.args.PyTreeRestore(
-                    item=state, restore_args=restore_args
-                ),
-            )
-            restored_step = self._manager.latest_step()
-        except TypeError as e:
-            # Orbax hits TypeError if there are no checkpoints, since it attempts to format `None`
-            # as the step dir.
+        logging.info(f"MAGGIEJZ DEBUG: input state type: {type(state)}")
+        logging.info(f"MAGGIEJZ DEBUG: input state: {state}")
+        latest_step = self._manager.latest_step()
+        if latest_step is None:
             if step is not None:
-                raise ValueError(f"Failed to restore at step {step}.") from e
-            logging.info("Could not find any completed checkpoints under %s: %s", cfg.dir, e)
+                raise ValueError(f"Failed to restore at step {step} since no checkpoints were found.")
+            logging.info(f"No existing checkpoints were found. Returning step=None.")
             return None, state  # Return the input state.
+        else:
+            def _restore_args(x: Any) -> ocp.RestoreArgs:
+                if isinstance(x, (Tensor, TensorSpec)):
+                    return ocp.checkpoint_utils.construct_restore_args(
+                        jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding)
+                    )
+                elif isinstance(x, tf.data.Iterator):
+                    return _TfIteratorHandler.RestoreArgs(item=x)
+                else:
+                    return None
 
-        return restored_step, restored_state
+            restore_args = jax.tree_util.tree_map(_restore_args, state)
+
+            try:
+                logging.info(f"MAGGIEJZ DEBUG Orbax: Restoring emergency checkpointer...")
+                restored_state = self._manager.restore(
+                    latest_step,
+                    args=ocp.args.PyTreeRestore(
+                        item=state, restore_args=restore_args
+                    ),
+                )
+                logging.info(f"MAGGIEJZ DEBUG: restored state type: {type(restored_state)}")
+                logging.info(f"MAGGIEJZ DEBUG: restored state: {restored_state}")
+            # TODO: the below is not needed anymore since Orbax no longer throws TypeError if no checkpoints were found
+            # See: https://github.com/google/orbax/blob/main/checkpoint/orbax/checkpoint/experimental/emergency/checkpoint_manager.py#L1301
+            except TypeError as e:
+                if step is not None:
+                    raise ValueError(f"Failed to restore at step {step}.") from e
+                return None, state  # Return the input state.
+
 
     def wait_until_finished(self):
         """See `BaseCheckpointer.wait_until_finished` docstring for details."""

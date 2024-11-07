@@ -117,7 +117,7 @@ def initialize_jax_for_tpu_with_emergency_checkpointing(local_checkpoint_dir,**i
                         " enabled. This should not happen and your workload may have unexpected behavior.")
         jax.distributed.initialize(**init_kwargs)
 
-    ocp.multihost.utils.initialize_runtime_to_distributed_ids()
+    ocp.multihost.initialize_runtime_to_distributed_ids()
 
 def _retrieve_jax_init_info(local_checkpoint_dir):
     """Retrieve JAX init info from a local file."""
