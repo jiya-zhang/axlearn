@@ -2,9 +2,12 @@
 
 """A library with common flags to launch a trainer."""
 
-# pylint: disable=wrong-import-position,wrong-import-order
+import importlib
 import os
 import sys
+
+# pylint: disable=wrong-import-position,wrong-import-order
+from contextlib import nullcontext
 
 # pylint: disable-next=ungrouped-imports
 from axlearn.common import compiler_options

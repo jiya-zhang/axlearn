@@ -54,6 +54,15 @@ flags.DEFINE_integer(
     "If the trainer.step does not increment within this interval, "
     "the watchdog will log the stack traces of all threads.",
 )
+flags.DEFINE_enum(
+    "device_monitor",
+    "none",
+    ["none", "tpu"],
+    "Whether to enable the device monitor. "
+    "The device monitor collects the system metrics and logs them periodically. "
+    "The device monitor also logs the idle status of the devices on the host, "
+    "and trigger a watchdog if the devices are idle for 10 minutes.",
+)
 flags.DEFINE_string(
     "mesh_selector",
     None,
@@ -100,12 +109,12 @@ def get_trainer_config(
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
     if trainer_config.watchdog_timeout_seconds is None:
         trainer_config.watchdog_timeout_seconds = flag_values.trainer_watchdog_timeout_seconds
-
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
     if flag_values.local_checkpoint_dir is not None:
         trainer_config.checkpointer.local_checkpoint_dir = FLAGS.local_checkpoint_dir
 
+        trainer_config.device_monitor = create_tpu_monitor()
     return trainer_config
 
 
