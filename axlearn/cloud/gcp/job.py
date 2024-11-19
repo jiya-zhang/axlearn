@@ -472,7 +472,7 @@ class TPUGKEJob(GKEJob):
             **common_kwargs,
         )
         flags.DEFINE_list(
-            "import_pathways", [], "Modules to enable pathways proxy.", **common_kwargs
+            "import_modules", [], "Modules to enable pathways proxy.", **common_kwargs
         )
 
     @classmethod
