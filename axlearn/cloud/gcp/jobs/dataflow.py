@@ -256,13 +256,7 @@ class DataflowJob(GCPJob):
         cmd = f"bash -c {shlex.quote(cmd)}"
         logging.info("Executing in subprocess: %s", cmd)
         with subprocess.Popen(cmd, shell=True, text=True) as proc:
-            # Attempt to cleanup the process when exiting.
-            def sig_handler(sig: int, _):
-                send_signal(proc, sig=sig)
-
-            # SIGTERM for kill, SIGINT for ctrl+c, and SIGHUP for screen quit.
-            for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]:
-                signal.signal(sig, sig_handler)
+            logging.info("Removed sig handler.")
 
             handle_popen(proc)
 
