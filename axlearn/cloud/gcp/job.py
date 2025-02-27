@@ -581,12 +581,14 @@ class TPUGKEJob(GKEJob):
                     JAX_PLATFORMS="proxy",
                     ENABLE_PATHWAYS_PERSISTENCE="1",
                     TPU_SKIP_MDS_QUERY="true",
+                    HOST_ADDRESS=f"{cfg.name}-pathways-head-0-0.{cfg.name}",
                 )
             elif job_type == "pathways-workers":
                 env_vars.update(
                     MEGASCALE_COORDINATOR_ADDRESS=f"{cfg.name}-pathways-head-0-0.{cfg.name}",
                     MEGASCALE_NUM_SLICES=cfg.accelerator.num_replicas,
                     MEGASCALE_SLICE_ID=0,
+                    PATHWAYS_HEAD=f"{cfg.name}-pathways-head-0-0.{cfg.name}",
                 )
                 args.extend(
                     [
@@ -691,6 +693,12 @@ class TPUGKEJob(GKEJob):
             dict(
                 name="pathways-proxy",
                 image="us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:latest",
+                env=[
+                    {
+                        "name": "PATHWAYS_HEAD",
+                        "value": f"{cfg.name}-pathways-head-0-0.{cfg.name}",
+                    }
+                ],
                 # https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#pod-sidecar-containers
                 # SideCar container is an init container with restartPolicy as "Always".
                 restartPolicy="Always",
@@ -711,6 +719,10 @@ class TPUGKEJob(GKEJob):
                     {
                         "name": "TPU_SKIP_MDS_QUERY",
                         "value": "true",
+                    },
+                    {
+                        "name": "HOST_ADDRESS",
+                        "value": f"{cfg.name}-pathways-head-0-0.{cfg.name}",
                     },
                 ],
                 args=[
@@ -786,7 +798,7 @@ class TPUGKEJob(GKEJob):
                 labels.update({"bastion-tier": "reserved"})
             else:
                 logging.info("Found tier=%s in env. Using spot quota", tier)
-                selector.update({"cloud.google.com/gke-spot": "true"})
+                #selector.update({"cloud.google.com/gke-spot": "true"})
                 tolerations.append(
                     {
                         "key": "cloud.google.com/gke-spot",
@@ -827,7 +839,7 @@ class TPUGKEJob(GKEJob):
                     # the original jobset attempts to restart (node pool conflict). This is more
                     # reliable at the moment but doesn't take advantage of node pool sharing. GCP is
                     # working on a fix.
-                    "provisioner-nodepool-id": cfg.name,
+                    # "provisioner-nodepool-id": cfg.name,
                 }
             )
 
