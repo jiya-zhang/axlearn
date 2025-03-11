@@ -68,6 +68,11 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+flags.DEFINE_string(
+    "pdbs",
+    None,
+    "Per device batch size (Overrides global batch size).",
+)
 
 FLAGS = flags.FLAGS
 

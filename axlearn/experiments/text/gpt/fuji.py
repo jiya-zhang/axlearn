@@ -406,6 +406,10 @@ def get_trainer_kwargs(
             ),
         )
     elif model_size == "70B":
+        if FLAGS.pdbs:
+            import jax
+            train_batch_size = len(jax.devices()) * int(FLAGS.pdbs)
+
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=80,
