@@ -798,7 +798,7 @@ class TPUGKEJob(GKEJob):
                 labels.update({"bastion-tier": "reserved"})
             else:
                 logging.info("Found tier=%s in env. Using spot quota", tier)
-                #selector.update({"cloud.google.com/gke-spot": "true"})
+                # selector.update({"cloud.google.com/gke-spot": "true"})
                 tolerations.append(
                     {
                         "key": "cloud.google.com/gke-spot",
@@ -880,7 +880,7 @@ class TPUGKEJob(GKEJob):
 
         if job_type == "pathways-head":
             # Target a specific CPU nodepool for Pathways containers
-            selector.update({"node.kubernetes.io/instance-type": "n2-standard-32"})
+            selector.update({"node.kubernetes.io/instance-type": "n2d-standard-32"})
             initContainers.extend(self._build_pathways_containers())
         else:
             selector.update(
