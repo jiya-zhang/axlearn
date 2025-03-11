@@ -4,6 +4,7 @@
 
 Note that these utilities do not handle resource management.
 """
+
 import atexit
 import importlib
 import io
@@ -31,7 +32,7 @@ from axlearn.cloud.common.bastion import (
 from axlearn.cloud.common.bundler import BaseDockerBundler
 from axlearn.cloud.common.job import Job
 from axlearn.cloud.common.utils import parse_kv_flags, subprocess_run
-from axlearn.cloud.gcp.config import default_project, default_zone, gcp_settings
+from axlearn.cloud.gcp.config import default_env_id, default_project, default_zone, gcp_settings
 from axlearn.cloud.gcp.node_pool import PRE_PROVISIONER_LABEL
 from axlearn.cloud.gcp.scopes import DEFAULT_TPU_SCOPES
 from axlearn.cloud.gcp.system_characteristics import (
@@ -76,6 +77,8 @@ class GCPJob(Job):
         project: Required[str] = REQUIRED
         # GCP zone.
         zone: Required[str] = REQUIRED
+        # GCP env_id.
+        env_id: Optional[str] = None
         # If not none, the current job will be executed as the service account.
         service_account: Optional[str] = None
 
@@ -85,6 +88,12 @@ class GCPJob(Job):
         common_kwargs = dict(flag_values=fv, allow_override=True)
         flags.DEFINE_string("project", default_project(), "The GCP project name.", **common_kwargs)
         flags.DEFINE_string("zone", default_zone(), "The GCP zone name.", **common_kwargs)
+        flags.DEFINE_string(
+            "env_id",
+            default_env_id(),
+            "The env_id, used along with project to identify `gcp_settings`.",
+            **common_kwargs,
+        )
         flags.DEFINE_string(
             "service_account",
             None,
@@ -312,6 +321,8 @@ class GCSFuseMount(VolumeMount):
         cpu: Defaults to 250m. Increase if higher throughput needed.
         memory: Defaults to 256Mi. Set proportionally to number of files processed (not filesize).
         ephemeral_gb: Defaults to 5Gi. Used for staging temp files before uploading to GCS.
+        shared_memory: Default to 1Gi. Used for e.g. Grain-related jobs which store prefetch
+            elements in shared_memory. Setting it to 0 means unlimited shared_memory.
         read_only: Whether the mount should be read-only.
     """
 
@@ -321,6 +332,7 @@ class GCSFuseMount(VolumeMount):
     cpu: str = "250m"
     memory: str = "256Mi"
     ephemeral_gb: str = "5Gi"
+    shared_memory: str = "1Gi"
 
 
 @dataclass(kw_only=True)
@@ -544,7 +556,12 @@ class TPUGKEJob(GKEJob):
         volume_mounts = [self._output_volume_mount]
         resources = {"limits": {}}
 
-        self._maybe_add_volume_mount(volume_mounts, spec=cfg.gcsfuse_mount)
+        if cfg.gcsfuse_mount:
+            self._maybe_add_volume_mount(volume_mounts, spec=cfg.gcsfuse_mount)
+            self._maybe_add_volume_mount(
+                volume_mounts, spec=VolumeMount(name="shared-memory", mount_path="/dev/shm")
+            )
+
         if cfg.host_mounts:
             for mount in cfg.host_mounts:
                 self._maybe_add_volume_mount(volume_mounts, spec=mount)
@@ -750,13 +767,21 @@ class TPUGKEJob(GKEJob):
 
         volumes.append(dict(name="shared-output", emptyDir={}))
         if cfg.gcsfuse_mount:
+            # Increases the shared memory volumes when enabled gcsfuse. This is useful when grain
+            # prefetch is enabled.
+            volumes.append(self._build_shared_memory_volumes(cfg.gcsfuse_mount.shared_memory))
             # Mount a GCS bucket as a volume.
             annotations.update(
                 {
                     "gke-gcsfuse/volumes": "true",
-                    "gke-gcsfuse/cpu-limit": cfg.gcsfuse_mount.cpu,
-                    "gke-gcsfuse/memory-limit": cfg.gcsfuse_mount.memory,
-                    "gke-gcsfuse/ephemeral-storage-limit": cfg.gcsfuse_mount.ephemeral_gb,
+                    "gke-gcsfuse/cpu-request": cfg.gcsfuse_mount.cpu,
+                    "gke-gcsfuse/memory-request": cfg.gcsfuse_mount.memory,
+                    "gke-gcsfuse/ephemeral-storage-request": cfg.gcsfuse_mount.ephemeral_gb,
+                    # GCSFuse will set limits=request if we only set requests:
+                    # https://github.com/GoogleCloudPlatform/gcs-fuse-csi-driver/blob/main/pkg/webhook/config.go#L110
+                    "gke-gcsfuse/cpu-limit": "0",
+                    "gke-gcsfuse/memory-limit": "0",
+                    "gke-gcsfuse/ephemeral-storage-limit": "0",
                 }
             )
             # Parse GCSFuseMount path into bucket, prefix.
@@ -764,6 +789,9 @@ class TPUGKEJob(GKEJob):
             # https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/cloud-storage-fuse-csi-driver#consume-ephemeral-volume-pod
             # Caveat: --implicit-dirs might have negative impacts on i/o performance. See
             # https://github.com/googlecloudplatform/gcsfuse/blob/master/docs/semantics.md .
+            # See https://cloud.google.com/storage/docs/cloud-storage-fuse/config-file for more
+            # details about mountOptions.
+            # The mountOptions are following https://github.com/AI-Hypercomputer/maxtext/pull/1070.
             volumes.append(
                 dict(
                     name=cfg.gcsfuse_mount.name,
@@ -772,7 +800,9 @@ class TPUGKEJob(GKEJob):
                         readOnly=cfg.gcsfuse_mount.read_only,
                         volumeAttributes=dict(
                             bucketName=parsed.netloc,
-                            mountOptions=f"only-dir={parsed.path.lstrip('/')},implicit-dirs",
+                            # pylint: disable=line-too-long
+                            mountOptions=f"only-dir={parsed.path.lstrip('/')},implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,kernel-list-cache-ttl-secs=-1",
+                            gcsfuseMetadataPrefetchOnMount="true",  # Improves first-time read.
                         ),
                     ),
                 )
@@ -1187,10 +1217,10 @@ class GPUGKEJob(GKEJob):
                 "NCCL_GPUDIRECTTCPX_TX_COMPLETION_NANOSLEEP": "1000",
                 "NCCL_GPUDIRECTTCPX_PROGRAM_FLOW_STEERING_WAIT_MICROS": "1000000",
                 "NCCL_GPUDIRECTTCPX_TX_BINDINGS": (
-                    "eth1:8-21,112-125;eth2:8-21,112-125;" "eth3:60-73,164-177;eth4:60-73,164-177"
+                    "eth1:8-21,112-125;eth2:8-21,112-125;eth3:60-73,164-177;eth4:60-73,164-177"
                 ),
                 "NCCL_GPUDIRECTTCPX_RX_BINDINGS": (
-                    "eth1:22-35,124-139;eth2:22-35,124-139;" "eth3:74-87,178-191;eth4:74-87,178-191"
+                    "eth1:22-35,124-139;eth2:22-35,124-139;eth3:74-87,178-191;eth4:74-87,178-191"
                 ),
                 "NCCL_GPUDIRECTTCPX_SOCKET_IFNAME": "eth1,eth2,eth3,eth4",
                 "NCCL_GPUDIRECTTCPX_CTRL_DEV": "eth0",
@@ -1259,8 +1289,7 @@ class GPUGKEJob(GKEJob):
         return dict(
             name="tcpx-nccl-plugin-installer",
             image=(
-                "us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpx/"
-                "nccl-plugin-gpudirecttcpx-dev:v3.1.7"
+                "us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpx/nccl-plugin-gpudirecttcpx-dev:v3.1.7"
             ),
             command=command,
             env=[{"name": "LD_LIBRARY_PATH", "value": "/usr/local/nvidia/lib64"}],

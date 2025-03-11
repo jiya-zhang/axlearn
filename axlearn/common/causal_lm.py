@@ -6,6 +6,7 @@ import math
 import re
 from typing import Callable, Optional, Union
 
+import jax
 from absl import logging
 from jax import numpy as jnp
 from jax._src.mesh import thread_resources
@@ -20,7 +21,7 @@ from axlearn.common.attention import (
 )
 from axlearn.common.base_layer import RematSpec
 from axlearn.common.base_model import BaseModel
-from axlearn.common.config import ConfigOr, config_class
+from axlearn.common.config import REQUIRED, ConfigOr, Required, config_class
 from axlearn.common.decoder import Decoder
 from axlearn.common.decoding import (
     BeamSearchOutputs,
@@ -32,14 +33,281 @@ from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.layers import LayerNorm
 from axlearn.common.logit_modifiers import LogitsToLogitsFn
 from axlearn.common.loss import cross_entropy
-from axlearn.common.metrics import WeightedScalar
+from axlearn.common.metrics import BaseLossMetrics, WeightedScalar
 from axlearn.common.module import Module, NestedTensor, Tensor, child_context
 from axlearn.common.param_init import PARAM_REGEXP_WEIGHT, DefaultInitializer, WeightInitializer
-from axlearn.common.utils import flatten_items, with_sharding_constraint
+from axlearn.common.utils import (
+    Nested,
+    flatten_items,
+    validate_contains_paths,
+    with_sharding_constraint,
+)
 
 
 def layer_norm_config(eps=1e-5):
     return LayerNorm.default_config().set(eps=eps)
+
+
+class CrossEntropyLossMetrics(BaseLossMetrics):
+    """Computes cross entropy loss and related training summaries."""
+
+    @config_class
+    class Config(BaseLossMetrics.Config):
+        """Configures CrossEntropyLossMetrics.
+
+        Attributes:
+            z_loss_scale: An auxiliary z-loss scale. If not None and >0, encourages the softmax
+                normalizer to be well behaved.
+        """
+
+        z_loss_scale: Optional[float] = None
+
+    def forward(
+        self,
+        input_batch: Nested[Tensor],
+        *,
+        predict_outputs: Nested[Tensor],
+        module_outputs: Nested[Tensor],
+    ) -> tuple[Tensor, Nested[Tensor]]:
+        """Computes cross entropy loss.
+
+        Args:
+            input_batch: A dict containing at minimum:
+                target_labels: An int Tensor of shape [...]. Negative targets do not contribute to
+                    the loss calculation.
+            predict_outputs: A dict containing at minimum:
+                logits: A float Tensor of shape [..., num_classes].
+            module_outputs: Unused.
+
+        Returns:
+            A tuple (loss, metrics):
+                loss: A scalar float Tensor corresponding to cross entropy loss, including auxiliary
+                    z-loss if `cfg.z_loss_scale` is provided.
+                metrics: A dict containing:
+                    cross_entropy: Same as loss.
+                    per_token_loss: A float Tensor of same shape as `target_labels`. Ignored targets
+                        will be masked, i.e., have per-token loss of 0.
+                    live_targets: A bool Tensor of same shape as `target_labels`. False indicates
+                        ignored targets.
+                    num_targets: A scalar int Tensor corresponding to number of live targets.
+        """
+        del module_outputs
+        validate_contains_paths(input_batch, paths=["target_labels"])
+        validate_contains_paths(predict_outputs, paths=["logits"])
+
+        cfg: CrossEntropyLossMetrics.Config = self.config
+
+        target_labels: Tensor = input_batch["target_labels"]
+        target_num_bytes: Optional[Tensor] = input_batch.get("target_num_bytes")
+        live_targets: Optional[Tensor] = input_batch.get("live_targets")
+        logits = predict_outputs["logits"]
+
+        if live_targets is None:
+            live_targets = target_labels >= 0
+        num_targets = live_targets.sum()
+        accuracy = (
+            jnp.equal(jnp.argmax(logits, axis=-1), target_labels) * live_targets
+        ).sum() / jnp.maximum(1, num_targets)
+
+        loss, loss_dict = cross_entropy(
+            logits=logits,
+            target_labels=target_labels,
+            live_targets=live_targets,
+            z_loss_scale=cfg.z_loss_scale if cfg.z_loss_scale is not None else 0.0,
+        )
+        per_token_loss = loss_dict["per_target_loss"] * live_targets
+        self.add_summary("accuracy", WeightedScalar(accuracy, num_targets))
+        self.add_summary("z_loss", WeightedScalar(loss_dict["z_loss"], num_targets))
+        if target_num_bytes is not None:
+            # N.B. we calculate bpb following Appendix D.2. of <https://arxiv.org/abs/2112.11446>,
+            # (i.e. treat each token as an equal with the others in the batch).
+            # This is also consistent with how we calculate the other metrics.
+            total_bytes = target_num_bytes.sum()
+            bits_per_byte = per_token_loss.sum() / jnp.maximum(1, total_bytes) / jnp.log(2)
+            self.add_summary("bits_per_byte", WeightedScalar(bits_per_byte, total_bytes))
+        metrics = {
+            "cross_entropy": loss,
+            "per_token_loss": per_token_loss,
+            "live_targets": live_targets,
+            "num_targets": num_targets,
+        }
+        self.add_summary("cross_entropy_loss", WeightedScalar(loss, num_targets))
+        self.add_summary("perplexity", WeightedScalar(jnp.exp(loss), num_targets))
+        self.add_summary("loss", WeightedScalar(loss, num_targets))
+        self.add_summary(
+            "train_live_targets",
+            WeightedScalar(num_targets / target_labels.shape[0], target_labels.shape[0]),
+        )
+        return loss, metrics
+
+
+class AuxLossMetrics(BaseLossMetrics):
+    """Computes aux loss by aggregating across layers.
+
+    Aux loss metrics added via `add_module_output` are aggregated and returned.
+    """
+
+    @config_class
+    class Config(BaseLossMetrics.Config):
+        """Configures AuxLossMetrics.
+
+        Attributes:
+            aux_loss_regex: If not None, collect Tensors from `module_outputs` whose paths fully
+                match the regular expression and compute the sum as the auxiliary loss, which will
+                be added to the overall model loss and reported in the summary as `aux_loss`.
+                This can be used to support regularization losses such as the load balancing loss in
+                MoE routing.
+        """
+
+        aux_loss_regex: Optional[str] = None
+
+    def forward(
+        self,
+        input_batch: Nested[Tensor],
+        *,
+        predict_outputs: Nested[Tensor],
+        module_outputs: Nested[Tensor],
+    ) -> tuple[Tensor, Nested[Tensor]]:
+        """Computes aux loss by aggregating module outputs from all layers.
+
+        Args:
+            input_batch: A dict containing at minimum:
+                target_labels: An int Tensor of any shape. Negative targets do not contribute to
+                    the loss calculation.
+            predict_outputs: Unused.
+            module_outputs: A nested Tensor consisting of outputs added via `add_module_output`.
+                Paths within `module_outputs` will be full-matched against `aux_loss_regex`.
+
+        Returns:
+            A tuple (loss, metrics):
+                loss: A scalar float Tensor corresponding to the aux loss.
+                metrics: A dict containing:
+                    aux_loss: Same as loss.
+        """
+        del predict_outputs
+
+        cfg: AuxLossMetrics.Config = self.config
+        regex = cfg.aux_loss_regex
+
+        if regex is None:
+            return 0.0, {}
+
+        validate_contains_paths(input_batch, paths=["target_labels"])
+        target_labels: Tensor = input_batch["target_labels"]
+        live_targets = target_labels >= 0
+        num_targets = live_targets.sum()
+
+        logging.info("Module outputs: %s", jax.tree_structure(module_outputs))
+        accumulation = []
+        for k, v in flatten_items(module_outputs):
+            if re.fullmatch(regex, k):
+                logging.info("Aux loss found at %s", k)
+                accumulation.append(v.mean())
+            else:
+                logging.info("Aux loss not found at %s", k)
+
+        if accumulation:
+            aux_loss = sum(accumulation) / len(accumulation)
+        else:
+            logging.warning("Aux loss not found: %s", cfg.aux_loss_regex)
+            aux_loss = 0.0
+
+        self.add_summary("aux_loss", WeightedScalar(aux_loss, num_targets))
+        return aux_loss, {"aux_loss": aux_loss}
+
+
+def _update(x: dict, updates: dict):
+    """Equivalent to `x.update(updates)` but raises upon key conflicts."""
+    if not x.keys().isdisjoint(updates.keys()):
+        raise KeyError(f"Key conflict: {set(x.keys()).intersection(updates)}")
+    x.update(updates)
+
+
+class CompositeLossMetrics(BaseLossMetrics):
+    """Computes a composite loss from multiple child metrics."""
+
+    @config_class
+    class Config(BaseLossMetrics.Config):
+        """Configures CompositeLossMetrics.
+
+        Attributes:
+            metrics: A mapping from child name to metrics config.
+            loss_weights: An optional mapping from child name to loss weight.
+                If None, all weights are considered 1.
+            flatten_metrics: Whether to flatten summaries and metrics from each child. If None,
+                defaults to True.
+        """
+
+        metrics: Required[dict[str, BaseLossMetrics.Config]] = REQUIRED
+        loss_weights: Optional[dict[str, float]] = None
+        flatten_metrics: Optional[bool] = None
+
+    def __init__(self, cfg, *, parent):
+        super().__init__(cfg, parent=parent)
+        cfg: CompositeLossMetrics.Config = self.config
+        self._metrics: dict[str, BaseLossMetrics] = {}
+        for name, child in cfg.metrics.items():
+            self._metrics[name] = self._add_child(name, child)
+        if cfg.loss_weights is not None and cfg.metrics.keys() != cfg.loss_weights.keys():
+            raise ValueError(f"Expected {cfg.loss_weights.keys()=} to match {cfg.metrics.keys()}.")
+
+    def forward(
+        self,
+        input_batch: Nested[Tensor],
+        *,
+        predict_outputs: Nested[Tensor],
+        module_outputs: Nested[Tensor],
+    ) -> tuple[Tensor, Nested[Tensor]]:
+        """Combines losses and metrics from the configured children.
+
+        By default, losses are summed and metrics/summaries are flattened, raising if any keys
+        conflict.
+        """
+        cfg: CompositeLossMetrics.Config = self.config
+        loss = 0
+        metrics = {}
+
+        for name, child in self._metrics.items():
+            child_loss, child_metrics = child.forward(
+                input_batch=input_batch,
+                predict_outputs=predict_outputs,
+                module_outputs=module_outputs,
+            )
+            if cfg.loss_weights is not None:
+                child_loss *= cfg.loss_weights[name]
+            loss = loss + child_loss
+
+            ctx = self.get_invocation_context()
+
+            if cfg.flatten_metrics is False:
+                _update(metrics, {name: child_metrics})
+            else:
+                _update(ctx.output_collection.summaries, ctx.output_collection.summaries.pop(name))
+                _update(metrics, child_metrics)
+
+        return loss, metrics
+
+
+def metrics_config(
+    *,
+    z_loss_scale: Optional[float] = None,
+    aux_loss_regex: Optional[str] = None,
+) -> CompositeLossMetrics.Config:
+    """Constructs a default causal-lm metrics config.
+
+    Args:
+        z_loss_scale: Auxiliary z-loss scale. See `CrossEntropyLossMetrics.Config`.
+        aux_loss_regex: Aux loss regex. See `AuxLossMetrics.Config`.
+
+    Returns:
+        A composite of cross entropy and aux loss.
+    """
+    return CompositeLossMetrics.default_config().set(
+        metrics={
+            "lm": CrossEntropyLossMetrics.default_config().set(z_loss_scale=z_loss_scale),
+            "aux": AuxLossMetrics.default_config().set(aux_loss_regex=aux_loss_regex),
+        }
+    )
 
 
 class Model(BaseModel):
@@ -51,27 +319,24 @@ class Model(BaseModel):
 
         # Decoder.
         decoder: Decoder.Config = Decoder.default_config()
-        # An auxiliary z-loss scale. If >0 encourages the softmax normalizer to be well behaved.
-        z_loss_scale: float = 0.0
-        # Batch mesh axis name(s).
+        # TODO(markblee): Remove `batch_axis_names` and `seq_axis_names`. Input sharding should
+        # happen at `Input.dispatch_global_batch` instead.
+        # Batch mesh axis name(s). (Deprecated.)
         # These will be used to constrain the batch (first) axis of relevant inputs.
-        batch_axis_names: tuple[str] = ("data",)
-        # Sequence-parallel mesh axis name(s).
+        # If None, no batch dim constraints are applied, rather than replicating across batch dim.
+        batch_axis_names: Optional[tuple[str]] = ("data",)
+        # Sequence-parallel mesh axis name(s). (Deprecated.)
         # These will be used to constrain the sequence axis of relevant inputs.
         # If None, no batch sequence dim constraints are applied.
         seq_axis_names: Optional[tuple[str]] = None
-        # If not None, collect Tensors from `module_outputs` whose paths fully match the regular
-        # expression and compute the sum as the auxiliary loss, which will be added to the overall
-        # model loss and reported in the summary as `aux_loss`.
-        #
-        # This can be used to support regularization losses such as the load balancing loss in MoE
-        # routing.
-        aux_loss_regex: Optional[str] = None
+        # Configures training metrics.
+        metrics: BaseLossMetrics.Config = metrics_config()
 
     def __init__(self, cfg: Config, *, parent: Module):
         super().__init__(cfg, parent=parent)
         cfg = self.config
         self._add_child("decoder", cfg.decoder)
+        self._add_child("metrics", cfg.metrics)
 
     @classmethod
     def default_config(cls):
@@ -116,32 +381,17 @@ class Model(BaseModel):
             aux_outputs (a dict):
                 logits: a float Tensor of shape [batch_size, seq_len, vocab_size].
                 hidden_states: a float Tensor of shape [batch_size, seq_len, hidden_dim].
-                per_label_loss: a float Tensor of shape [batch_size, seq_len].
+                metrics: a nested Tensor. See corresponding `metrics` implementation for details.
         """
         predictions = self.predict(input_batch)
         aux_outputs = {**predictions}
-        # [batch source_length, vocab_size]
         loss = None
         target_labels: Tensor = input_batch.get("target_labels")
-        target_num_bytes: Tensor = input_batch.get("target_num_bytes")
         if target_labels is not None:
-            self.vlog(3, "targets=%s(%s)", target_labels.dtype, target_labels.shape)
-            metrics = self._metrics(
-                predictions["logits"],
-                target_labels=target_labels,
-                target_num_bytes=target_num_bytes,
-            )
-            loss = metrics["loss"]
-            num_targets = metrics["num_targets"]
-            aux_outputs["per_label_loss"] = metrics["per_token_loss"]
-            if self.config.aux_loss_regex is not None:
-                aux_outputs["aux_loss"] = metrics["aux_loss"]
-            self.add_summary(
-                "train_live_targets",
-                WeightedScalar(num_targets / target_labels.shape[0], target_labels.shape[0]),
-            )
+            loss, metrics = self._metrics(input_batch=input_batch, predict_outputs=predictions)
+            aux_outputs.update(loss=loss, metrics=metrics)
         # If return_aux, return the logits and output pre LM head (useful for downstream tasks),
-        # as well as the per-token loss.
+        # as well as training metrics like the per-token-loss.
         #
         # N.B. Do not enable for large-scale training since auxiliary outputs are not partitioned.
         # TODO(rpang): support partitioning of auxiliary outputs.
@@ -196,7 +446,6 @@ class Model(BaseModel):
             stop_decoding_condition: StopDecodingCondition callable indicating if generation should
                 stop. If None, stop on EOS.
 
-
         Returns:
             Sample outputs.
         """
@@ -228,10 +477,7 @@ class Model(BaseModel):
         predictions = self.predict(input_batch)
         return predictions["logits"]
 
-    def score(
-        self,
-        input_batch: NestedTensor,
-    ) -> NestedTensor:
+    def score(self, input_batch: Nested[Tensor]) -> Nested[Tensor]:
         """Produce decoder score like per_token_loss and live_targets.
 
         Args:
@@ -248,11 +494,7 @@ class Model(BaseModel):
         """
         self._constrain_input_batch(input_batch)
         predictions = self.predict(input_batch)
-        results = self._metrics(
-            predictions["logits"],
-            input_batch["target_labels"],
-            target_num_bytes=None,
-        )
+        _, results = self._metrics(input_batch=input_batch, predict_outputs=predictions)
         return {k: v for k, v in results.items() if k in ("per_token_loss", "live_targets")}
 
     def predict(self, input_batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -275,75 +517,50 @@ class Model(BaseModel):
                 hidden_states: a float Tensor of shape [batch_size, seq_len, hidden_dim]
         """
         self._constrain_input_batch(input_batch)
-        input_ids: Tensor = input_batch["input_ids"]
-        token_type_ids: Optional[Tensor] = input_batch.get("token_type_ids")
-        input_segment_ids: Optional[Tensor] = input_batch.get("input_segment_ids")
-        input_positions: Optional[Tensor] = input_batch.get("input_positions")
+        # TODO(markblee): Simplify by using consistent naming between `input_positions` and
+        # `positions`, `input_segment_ids` and `segment_ids`.
         # Decoder hidden states: [batch_size, target_len, hidden_dim].
-        decoder_output = self.decoder(
-            # TODO(markblee): Simplify by using consistent naming between `input_positions` and
-            # `positions`, `input_segment_ids` and `segment_ids`.
-            input_batch=dict(
-                input_ids=input_ids,
-                token_type_ids=token_type_ids,
-                input_segment_ids=input_segment_ids,
-                positions=input_positions,
-            ),
-        )
-        return decoder_output
+        decoder_batch = {**input_batch}
+        decoder_batch["positions"] = input_batch.get("input_positions")
+        return self.decoder(input_batch=decoder_batch)
 
     def _metrics(
-        self,
-        logits: Tensor,
-        target_labels: Tensor,
-        target_num_bytes: Optional[Tensor],
-    ) -> dict[str, Tensor]:
-        live_targets = (target_labels != self.decoder.config.pad_token_id) & (target_labels >= 0)
-        num_targets = live_targets.sum()
-        accuracy = (
-            jnp.equal(jnp.argmax(logits, axis=-1), target_labels) * live_targets
-        ).sum() / jnp.maximum(1, num_targets)
+        self, input_batch: Nested[Tensor], *, predict_outputs: Nested[Tensor]
+    ) -> tuple[Tensor, Nested[Tensor]]:
+        cfg: Model.Config = self.config
+        target_labels: Tensor = input_batch["target_labels"]
+        self.vlog(3, "targets=%s(%s)", target_labels.dtype, target_labels.shape)
+        # Map padding targets to out-of-class label for metrics calculation.
+        target_labels = jnp.where(target_labels == cfg.decoder.pad_token_id, -1, target_labels)
 
-        loss, loss_dict = cross_entropy(
-            logits=logits,
-            target_labels=target_labels,
-            live_targets=live_targets,
-            z_loss_scale=self.config.z_loss_scale,
+        ctx = self.get_invocation_context()
+        loss, metrics = self.metrics.forward(
+            input_batch={**input_batch, "target_labels": target_labels},
+            predict_outputs=predict_outputs,
+            module_outputs=ctx.get_module_outputs(),
         )
-        per_token_loss = loss_dict["per_target_loss"] * live_targets
-        self.add_summary("accuracy", WeightedScalar(accuracy, num_targets))
-        self.add_summary("z_loss", WeightedScalar(loss_dict["z_loss"], num_targets))
-        if target_num_bytes is not None:
-            # N.B. we calculate bpb following Appendix D.2. of <https://arxiv.org/abs/2112.11446>,
-            # (i.e. treat each token as an equal with the others in the batch).
-            # This is also consistent with how we calculate the other metrics.
-            total_bytes = target_num_bytes.sum()
-            bits_per_byte = per_token_loss.sum() / jnp.maximum(1, total_bytes) / jnp.log(2)
-            self.add_summary("bits_per_byte", WeightedScalar(bits_per_byte, total_bytes))
-        loss_collection = {
-            "cross_entropy": loss,
-            "per_token_loss": per_token_loss,
-            "live_targets": live_targets,
-            "num_targets": num_targets,
-        }
-        self.add_summary("cross_entropy_loss", WeightedScalar(loss, num_targets))
-        self.add_summary("perplexity", WeightedScalar(jnp.exp(loss), num_targets))
-        if self.config.aux_loss_regex is not None:
-            aux_loss = self._aux_loss()  # `aux_loss` will be 0 if not computed in `module_outputs`.
-            loss = loss + aux_loss  # `aux_loss` should already be scaled during its computation.
-            self.add_summary("aux_loss", WeightedScalar(aux_loss, num_targets))
-            loss_collection["aux_loss"] = aux_loss
-        loss_collection["loss"] = loss
-        self.add_summary("loss", WeightedScalar(loss, num_targets))
-        return loss_collection
+        # Flatten summaries for backwards compatibility.
+        _update(ctx.output_collection.summaries, ctx.output_collection.summaries.pop("metrics"))
+
+        return loss, metrics
 
     def _constrain_input_batch(self, input_batch: NestedTensor):
         """Applies sharding constraints in-place for relevant named tensors in the input batch."""
         mesh = thread_resources.env.physical_mesh  # type: ignore
         if mesh.empty or mesh.size == 1:
             return
+        cfg: Model.Config = self.config
+        if cfg.batch_axis_names is None and cfg.seq_axis_names is None:
+            return
 
-        cfg = self.config
+        logging.log_first_n(
+            logging.WARNING,
+            "cfg.batch_axis_names and cfg.seq_axis_names are deprecated. "
+            "Dispatch inputs using `Input.dispatch_global_batch` instead. "
+            "See `input_base.Input.input_partitioner` for more details.",
+            1,
+        )
+
         for k, v in input_batch.items():
             if k in [
                 "input_ids",
@@ -365,17 +582,6 @@ class Model(BaseModel):
                 logging.log_first_n(
                     logging.WARNING, "Not constraining input_batch[%s].", len(input_batch), k
                 )
-
-    def _aux_loss(self) -> Tensor:
-        regex = self.config.aux_loss_regex
-        # Collect aux_loss from all leaves.
-        module_outputs = self.get_module_outputs()
-        accumulation = list(
-            v.mean() for k, v in flatten_items(module_outputs) if re.fullmatch(regex, k)
-        )
-        if accumulation:
-            return sum(accumulation) / len(accumulation)
-        return 0
 
 
 TransformerStackConfig = Union[

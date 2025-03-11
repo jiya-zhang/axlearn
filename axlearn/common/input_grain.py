@@ -40,7 +40,6 @@ import numpy as np
 from absl import logging
 from array_record.python.array_record_data_source import PathLikeOrFileInstruction
 from grain._src.python.data_loader import _determine_worker_count
-from grain._src.python.dataset import stats as dataset_stats
 from grain._src.python.dataset.transformations import packing
 from grain._src.python.dataset.transformations import slice as slice_dataset
 from jax.experimental import multihost_utils
@@ -132,7 +131,7 @@ def sample_from_datasets(
     sources: Sequence[Dataset],
     weights: Sequence[float],
 ) -> Dataset:
-    """Mixes one or more data sources.
+    """Mixes one or more repeated data sources.
 
     Different from `input_tf_data.sample_from_datasets`, the mixing is deterministic:
     https://github.com/google/grain/blob/ddf825c68b6d2c811f9e599d7fb7ae7572affd8c/grain/_src/python/dataset/transformations/mix.py#L222
@@ -149,21 +148,24 @@ def sample_from_datasets(
         A Dataset for the mixed data source.
     """
 
-    # Without repeat, mixing stops as soon as the first dataset is exhausted.
-    def maybe_repeat(ds: Dataset):
-        if not isinstance(ds, grain.MapDataset):
-            raise ValueError(
-                f"{sample_from_datasets.__name__} requires {grain.MapDataset.__name__}"
-            )
-        # Only repeat if not already infinite.
-        if len(ds) != sys.maxsize:
-            ds = ds.repeat()
-        return ds
+    def _ensure_repeated(sources: Sequence[Dataset]):
+        # There is no easy way to check if a grain.IterDataset is repeated.
+        for source in sources:
+            if isinstance(source, grain.MapDataset) and len(source) != sys.maxsize:
+                raise ValueError(
+                    f"sample_from_datasets requires each dataset to be repeated, {source} is not."
+                )
+            if isinstance(source, grain.IterDataset):
+                logging.info(
+                    "Sampling from grain.IterDataset, please make sure your dataset is repeated."
+                )
 
-    return grain.MapDataset.mix(
-        datasets=[maybe_repeat(source) for source in sources],
-        weights=weights,
-    )
+    _ensure_repeated(sources)
+    # If any of the datasets are grain.IterDataset, we should use grain.IterDataset.mix().
+    if any(isinstance(ds, grain.IterDataset) for ds in sources):
+        return grain.IterDataset.mix(datasets=sources, weights=weights)
+
+    return grain.MapDataset.mix(datasets=sources, weights=weights)
 
 
 def default_pad_example_fn(example: utils.Nested[Any]) -> utils.Nested[Any]:
@@ -180,44 +182,53 @@ def default_pad_example_fn(example: utils.Nested[Any]) -> utils.Nested[Any]:
 class _UnbatchDatasetIterator(grain.DatasetIterator):
     """An iterator that unbatches np.arrays along dim=0."""
 
-    def __init__(self, parent: grain.DatasetIterator):
-        super().__init__(stats=None)
-        self._parent = parent
+    def __init__(self, parent: grain.DatasetIterator, *, skip_empty_batch: bool = False):
+        super().__init__(parent)
         # Index within the unbatched inputs.
         self._index = 0
         self._current_batch = None
         # Don't advance parent state until all indices in current batch have been yielded.
         self._parent_state = self._parent.get_state()
+        self._skip_empty_batch = skip_empty_batch
 
     def __next__(self):
-        # Note that self._index may initially be non-zero, e.g. if restoring from checkpoint
-        # using `set_state`.
-        if self._current_batch is None:
-            # Possibly raises StopIteration.
-            example = next(self._parent)
-            leaves, structure = jax.tree.flatten(example)
-            if not leaves:
-                return next(self)  # Parent produced an empty batch, continue.
+        example = None
 
-            # Make sure all leaves have same batch dim.
-            if not all(leaves[0].shape[0] == x.shape[0] for x in leaves[1:]):
-                raise ValueError(
-                    f"Expected all leaves to have same batch dim: {utils.shapes(example)}"
-                )
-            self._current_batch = (leaves, structure)
+        # Use a loop to avoid having to recursively call next(self).
+        while example is None:
+            # Note that self._index may initially be non-zero, e.g. if restoring from checkpoint
+            # using `set_state`.
+            if self._current_batch is None:
+                # Possibly raises StopIteration.
+                example = next(self._parent)
+                leaves, structure = jax.tree.flatten(example)
+                if not leaves:
+                    example = None
+                    continue  # Parent produced an empty batch, continue.
 
-        leaves, structure = self._current_batch
-        assert len(leaves) > 0, self._current_batch
-        batch_size = leaves[0].shape[0]  # All leaves have same batch size due to check above.
-        assert 0 <= self._index < batch_size, (self._index, batch_size)
-        example = jax.tree.unflatten(structure, (x[self._index] for x in leaves))
-        self._index += 1
+                # Make sure all leaves have same batch dim.
+                if not all(leaves[0].shape[0] == x.shape[0] for x in leaves[1:]):
+                    raise ValueError(
+                        f"Expected all leaves to have same batch dim: {utils.shapes(example)}"
+                    )
+                self._current_batch = (leaves, structure)
 
-        # Move onto the next batch.
-        if self._index >= batch_size:
-            self._index = 0
-            self._current_batch = None
-            self._parent_state = self._parent.get_state()
+            leaves, structure = self._current_batch
+            assert len(leaves) > 0, self._current_batch
+            batch_size = leaves[0].shape[0]  # All leaves have same batch size due to check above.
+            if batch_size == 0 and self._skip_empty_batch:
+                example = None
+            else:
+                assert 0 <= self._index < batch_size, (self._index, batch_size)
+                example = jax.tree.unflatten(structure, (x[self._index] for x in leaves))
+            self._index += 1
+
+            # Move onto the next batch.
+            if self._index >= batch_size:
+                self._index = 0
+                self._current_batch = None
+                self._parent_state = self._parent.get_state()
+
         return example
 
     def get_state(self) -> dict[str, Any]:
@@ -234,14 +245,20 @@ class _UnbatchDatasetIterator(grain.DatasetIterator):
 
 
 class _UnbatchIterDataset(grain.IterDataset):
+    def __init__(self, parents, *, skip_empty_batch: bool = False):
+        super().__init__(parents)
+        self._skip_empty_batch = skip_empty_batch
+
     def __str__(self) -> str:
         return "UnbatchIterDataset"
 
     def __iter__(self) -> _UnbatchDatasetIterator:
-        return _UnbatchDatasetIterator(self._parent.__iter__())
+        return _UnbatchDatasetIterator(
+            self._parent.__iter__(), skip_empty_batch=self._skip_empty_batch
+        )
 
 
-def unbatch(ds: Dataset) -> Dataset:
+def unbatch(ds: Dataset, *, skip_empty_batch: bool = False) -> Dataset:
     """Similar to `input_tf_data.unbatch`.
 
     Unlike `batch`, which naively groups top-level elements, unbatch applies to JAX leaves only.
@@ -251,12 +268,14 @@ def unbatch(ds: Dataset) -> Dataset:
 
     Args:
         ds: A Dataset where each example has leaves with the same batch dim.
+        skip_empty_batch: Whether to skip batches with leading batch dim=0. If False, an assertion
+            error will be raised upon encountering an empty batch.
 
     Returns:
         A Dataset with unbatched inputs.
     """
     _ensure_iter_dataset(ds)
-    return _UnbatchIterDataset(ds)
+    return _UnbatchIterDataset(ds, skip_empty_batch=skip_empty_batch)
 
 
 def rekey(
@@ -467,10 +486,8 @@ class _FixedLengthDatasetIterator(grain.DatasetIterator):
         *,
         pad_example: Any,
         length: int,
-        stats: dataset_stats.Stats,
     ):
-        super().__init__(stats)
-        self._parent = parent
+        super().__init__(parent)
         self._pad_example = pad_example
         self._length = length
         self._i = 0
@@ -516,7 +533,6 @@ class _FixedLengthIterDataset(grain.IterDataset):
             parent_iter,
             pad_example=self._pad_example,
             length=self._length,
-            stats=self._stats,
         )
 
 
@@ -634,3 +650,22 @@ class Input(input_base.Input):
                     f"Please make sure to call {shard_dataset.__name__} if using input dispatch."
                 )
         return maybe_to_iter_dataset(ds)
+
+    def element_spec(self) -> utils.Nested[jax.ShapeDtypeStruct]:
+        """Infers the element spec.
+
+        Grain requires fetching an example from the dataset to extract the spec. To avoid reading
+        actual data, replace your source dataset with one from `input_fake.fake_grain_source`.
+        """
+        ds = self.dataset()
+        if isinstance(ds, grain.MapDataset):
+            example = ds[0]
+        else:
+            example = next(ds.__iter__())  # pylint: disable=unnecessary-dunder-call
+
+        def shape_dtype(x):
+            if not hasattr(x, "shape") or not hasattr(x, "dtype"):
+                raise ValueError(f"element_spec() requires Tensor-like leaves, got: {x}.")
+            return jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
+
+        return jax.tree.map(shape_dtype, example)

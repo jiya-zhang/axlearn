@@ -85,37 +85,65 @@ class UtilsTest(TestCase):
         dict(
             sources=[slice(0, 10, 2), slice(1, 5, 2)],
             weights=[1, 1],
+            is_iter_dataset=[False, False],
             take=10,
             expected=[0, 1, 2, 3, 4, 1, 6, 3, 8, 1],
         ),
         dict(
             sources=[slice(0, 10, 2), slice(1, 5, 2)],
             weights=[2, 1],
+            is_iter_dataset=[False, False],
             take=10,
             expected=[0, 2, 1, 4, 6, 3, 8, 0, 2, 1],
         ),
         dict(
             sources=[slice(0, 10, 2), slice(1, 5, 2)],
             weights=[1, 1e-9],
+            is_iter_dataset=[False, False],
             take=10,
             expected=[0, 2, 4, 6, 8, 0, 2, 4, 6, 8],
+        ),
+        # IterDataset
+        dict(
+            sources=[slice(0, 10, 2), slice(1, 5, 2)],
+            weights=[1, 1],
+            is_iter_dataset=[True, True],
+            take=10,
+            expected=[0, 1, 2, 3, 4, 1, 6, 3, 8, 1],
+        ),
+        # Mixture of IterDataset and MapDataset.
+        dict(
+            sources=[slice(0, 10, 2), slice(1, 5, 2)],
+            weights=[1, 1],
+            is_iter_dataset=[True, False],
+            take=10,
+            expected=[0, 1, 2, 3, 4, 1, 6, 3, 8, 1],
         ),
     )
     def test_sample_from_datasets(
         self,
         sources: list[slice],
         weights: list[int],
+        is_iter_dataset: list[bool],
         take: Optional[int],
         expected: list[int],
     ):
+        sources = [
+            range_dataset(start=src.start, stop=src.stop, step=src.step).repeat() for src in sources
+        ]
+        sources = [
+            source.to_iter_dataset() if should_convert else source
+            for source, should_convert in zip(sources, is_iter_dataset)
+        ]
         ds = sample_from_datasets(
-            sources=[
-                range_dataset(start=src.start, stop=src.stop, step=src.step) for src in sources
-            ],
+            sources=sources,
             weights=weights,
         )
-        ds = ds.slice(slice(0, take))
-        self.assertCountEqual(expected, list(ds))
+        ds_iter = iter(ds)
+        result = []
+        for _ in range(take):
+            result.append(next(ds_iter))
+        self.assertCountEqual(expected, list(result))
 
     def test_sample_from_datasets_errors(self):
         ds = range_dataset(start=0, stop=2)
@@ -124,17 +152,12 @@ class UtilsTest(TestCase):
         repeated_ds = sample_from_datasets(sources=[ds], weights=[1]).slice(slice(0, 4))
         self.assertEqual([0, 1, 0, 1], list(repeated_ds))
 
-        # Make sure that non-map dataset raises.
-        with self.assertRaisesRegex(ValueError, "MapDataset"):
-            ds = ds.to_iter_dataset()
-            sample_from_datasets(sources=[ds], weights=[1])
-
     def test_shuffle_dataset(self):
         # Test without repeat.
         ds = sample_from_datasets(
             sources=[
-                range_dataset(start=0, stop=10, step=2),
-                range_dataset(start=1, stop=5, step=2),
+                range_dataset(start=0, stop=10, step=2).repeat(),
+                range_dataset(start=1, stop=5, step=2).repeat(),
             ],
             weights=[2, 1],
         )
@@ -174,7 +197,7 @@ class UtilsTest(TestCase):
 
     def test_batch(self):
         # [0, 1, 2, 3, 4].
-        ds = range_dataset(start=0, stop=5, seed=123)
+        ds = range_dataset(start=0, stop=5, seed=123).repeat()
         # [1, 2, 3, 4, 5].
         other_ds = ds.map(_PlusOne())
         # [0, 1, 2, 1, 3, 4, 2, 5, 1, 3, ...].
@@ -258,10 +281,30 @@ class UtilsTest(TestCase):
 
         ds = range_dataset(start=1, stop=10)
         ds = ds.repeat(None).batch(3)
-        ds = ds.map(convert_examples, seed=123)
+        ds = ds.random_map(convert_examples, seed=123)
         ds = unbatch(maybe_to_iter_dataset(ds))
         ds = iter(ds)
         self._test_checkpointing(ds)
+
+    def test_unbatch_empty_batch(self):
+        # Test with skip_empty_batch=True.
+        ds = fake_grain_source(
+            [
+                {"x": np.array([]), "y": np.array([])},
+                {"x": np.array([]), "y": np.array([])},
+                {"x": np.array([1, 2]), "y": np.array([1, 2])},
+            ]
+        )
+        ds = unbatch(maybe_to_iter_dataset(ds), skip_empty_batch=True)
+        ds = iter(ds)
+        self.assertEqual({"x": 1, "y": 1}, next(ds))
+        self.assertEqual({"x": 2, "y": 2}, next(ds))
+
+        # Test with skip_empty_batch=False.
+        with self.assertRaisesRegex(AssertionError, "(0, 0)"):
+            ds = fake_grain_source([{"x": np.array([]), "y": np.array([])}])
+            ds = unbatch(maybe_to_iter_dataset(ds))
+            list(ds)
 
     @parameterized.parameters(
         dict(
@@ -567,3 +610,24 @@ class InputTest(parameterized.TestCase):
                 # Should contain the right ids.
                 self.assertEqual([0, 1, 2, 3], replicate_to_local_data(batch)["input_ids"].tolist())
                 break
+
+    def test_element_spec(self):
+        ds = range_dataset(start=0, stop=10, seed=123).map(lambda x: {"input_ids": x})
+        grain_input: Input = self._input_config(ds).instantiate(parent=None)
+        # element_spec() requires Tensor-like leaves.
+        with self.assertRaisesRegex(ValueError, "Tensor"):
+            grain_input.element_spec()
+
+        ds = range_dataset(start=0, stop=10, seed=123).map(lambda x: {"input_ids": np.array(x)})
+        cfg = self._input_config(
+            ds.repeat(num_epochs=None),
+            per_process=lambda ds: ds.batch(2),
+            process_count=4,
+            process_index=0,
+        )
+        grain_input: Input = cfg.instantiate(parent=None)
+        self.assertEqual(
+            # Element spec should reflect the per-process shape.
+            {"input_ids": jax.ShapeDtypeStruct(shape=(2,), dtype=np.int64)},
+            grain_input.element_spec(),
+        )

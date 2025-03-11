@@ -74,6 +74,9 @@ def default_xla_options(
             xla_tpu_scoped_vmem_limit_kib=98304,
             # For megascale performance.
             xla_jf_crs_combiner_threshold_count=10,
+            # TODO(hanzhi-zhou): temporary workaround to avoid PCIe overload when using multi-slice
+            # v6e training caused by allreduce over DCN. This flag doesn't impact performance.
+            xla_tpu_iova_dma_chunk_size_bytes=1048576,
         )
         options.update(
             # Improved performance for v6e.
@@ -174,6 +177,9 @@ def infer_tpu_version(tpu_type: str) -> str:
     """
     tpu_type = infer_tpu_type(tpu_type)
     tpu_version = tpu_type.rsplit("-", 1)[0]  # split from the last occurrence of '-'
+    # Resolve aliases like v5e to v5litepod, since in some cases (e.g. aot compilation) v5e is
+    # expected.
+    tpu_version = _TPU_VERSION_ALIASES.get(tpu_version, tpu_version)
     if tpu_version not in _TPU_VERSIONS:
         raise ValueError(f"Unknown TPU version {tpu_version}. Expected one of {_TPU_VERSIONS}")
     return tpu_version
@@ -238,4 +244,5 @@ def infer_xsc_compiler_options(
     return options
 
 
+_TPU_VERSION_ALIASES = {"v5e": "v5litepod"}
 _TPU_VERSIONS = ("v3", "v4", "v5litepod", "v5p", "v6e")

@@ -19,12 +19,12 @@ from jax.ad_checkpoint import checkpoint_policies as jax_remat_policies
 
 from axlearn.common import causal_lm, config
 from axlearn.common.attention import (
-    SELF_ATTENTION_SAVE_PATTERN,
     BaseStackedTransformerLayer,
     FusedGroupedQKVLinear,
     FusedQKVLinear,
     GroupedQueryAttention,
     MultiheadAttention,
+    RematRegexSavePatterns,
     RepeatedTransformerLayer,
     RoFormerQKVLinear,
 )
@@ -40,7 +40,10 @@ from axlearn.common.trainer_config_modifier import (
     MeshShapeModifier,
     RematSpecModifier,
 )
-from axlearn.common.utils import extended_checkpoint_policies
+from axlearn.common.utils import (
+    extended_checkpoint_policies,
+    save_and_offload_only_these_names_regex,
+)
 from axlearn.experiments.text.gpt.common import (
     STEP_DTYPE,
     SourceBuilder,
@@ -53,7 +56,7 @@ from axlearn.experiments.text.gpt.common import (
 )
 from axlearn.experiments.text.gpt.common import model_config as common_model_config
 from axlearn.experiments.text.gpt.common import scaled_hidden_dim
-from axlearn.experiments.trainer_config_utils import TrainerConfigFn
+from axlearn.experiments.trainer_config_utils import TrainerConfigFn, V6eFlashConfigModifier
 
 MODEL_SIZES = ("test", "1B", "3B", "7B", "8B", "70B")
 
@@ -62,13 +65,15 @@ class Version(enum.Enum):
     V1 = 1
     V2 = 2
     V3 = 3
+    V3_TIKTOKEN = "3-tiktoken"
 
 
 # Mapping from Fuji versions to vocab sizes.
 VOCAB_SIZE = {
     Version.V1: 32 * 1024,
     Version.V2: 32 * 1024,
-    Version.V3: 128256,
+    Version.V3: 128 * 1024,
+    Version.V3_TIKTOKEN: 128256,
 }
 
 
@@ -77,6 +82,7 @@ MAX_SEQUENCE_LENGTH = {
     Version.V1: 2048,
     Version.V2: 4096,
     Version.V3: 8192,
+    Version.V3_TIKTOKEN: 8192,
 }
 
 
@@ -84,8 +90,8 @@ ROPE_THETA = {
     Version.V1: 1e4,
     Version.V2: 1e4,
     Version.V3: 5e5,
+    Version.V3_TIKTOKEN: 5e5,
 }
-
 
 # Mapping from Fuji versions to total number of tokens used in training.
 TOTAL_TOKENS = {
@@ -103,6 +109,13 @@ TOTAL_TOKENS = {
         "test": 15 * (1024**4),  # 15T tokens
         "1B": 15 * (1024**4),  # 15T tokens
         "3B": 15 * (1024**4),  # 15T tokens
+        "7B": 15 * (1024**4),  # 15T tokens
+        "70B": 15 * (1024**4),  # 15T tokens
+    },
+    Version.V3_TIKTOKEN: {
+        "test": 15 * (1024**4),  # 15T tokens
+        "1B": 15 * (1024**4),  # 15T tokens
+        "3B": 15 * (1024**4),  # 15T tokens
         "8B": 15 * (1024**4),  # 15T tokens
         "70B": 15 * (1024**4),  # 15T tokens
     },
@@ -114,6 +127,7 @@ TOKENS_PER_BATCH = {
     Version.V1: 4 * (1024**2),
     Version.V2: 4 * (1024**2),
     Version.V3: 16 * (1024**2),
+    Version.V3_TIKTOKEN: 16 * (1024**2),
 }
 
 
@@ -126,15 +140,13 @@ def get_trainer_kwargs(
 ) -> dict[str, Any]:
     """Construct default trainer kwargs given a model size."""
     tokens_per_batch = TOKENS_PER_BATCH[version]
-    if model_size not in TOTAL_TOKENS[version]:
-        return {}
     max_step = TOTAL_TOKENS[version][model_size] // tokens_per_batch
     max_sequence_length = MAX_SEQUENCE_LENGTH[version]
     train_batch_size = tokens_per_batch // max_sequence_length
 
     # Whether to use grouped query attention.
     num_kv_heads = None
-    if version == Version.V3:
+    if version in (Version.V3, Version.V3_TIKTOKEN):
         num_kv_heads = 8
 
     rope_theta = ROPE_THETA[version]
@@ -147,7 +159,7 @@ def get_trainer_kwargs(
         extended_checkpoint_policies.save_and_offload_only_these_names_regex
     ).set(
         names_which_can_be_saved=None,
-        names_which_can_be_offloaded=SELF_ATTENTION_SAVE_PATTERN,
+        names_which_can_be_offloaded=RematRegexSavePatterns.NATIVE_ATTENTION.value,
         offload_src="device",
         offload_dst="pinned_host",
     )
@@ -308,6 +320,7 @@ def get_trainer_kwargs(
                                     ),
                                 }
                             ),
+                            V6eFlashConfigModifier.default_config(),
                         ],
                     ),
                 ),
@@ -320,7 +333,7 @@ def get_trainer_kwargs(
                 # v2 on gpu-p5.48xlarge-256, step time: 1.78s/step, MFU 39%.
                 # TODO(kelvin-zou): need to match 1.5s/step perf on TransformerEngine.
                 (
-                    "gpu-(p5.48xlarge|p4de.24xlarge|a3-highgpu-8g)-(256|512|1024)",
+                    "gpu-(p5.48xlarge|p4de.24xlarge|a3-highgpu-8g|a3-megagpu-8g)-(256|512|1024)",
                     mesh_shape_from_axes(data=-1, fsdp=8),
                 ),
             ),
@@ -400,7 +413,7 @@ def get_trainer_kwargs(
                 ),
                 ("tpu-v5p-.*", mesh_shape_from_axes(data=-1, fsdp=8)),
                 (
-                    "gpu-(p5.48xlarge|p4de.24xlarge|a3-highgpu-8g)-(256|512|1024)",
+                    "gpu-(p5.48xlarge|p4de.24xlarge|a3-highgpu-8g|a3-megagpu-8g)-(256|512|1024)",
                     mesh_shape_from_axes(data=-1, fsdp=8),
                 ),
             ),
@@ -467,6 +480,7 @@ def get_trainer_kwargs(
                                     ),
                                 }
                             ),
+                            V6eFlashConfigModifier.default_config(),
                         ],
                     ),
                 ),
@@ -486,6 +500,7 @@ def get_trainer_kwargs(
                                     ),
                                 }
                             ),
+                            V6eFlashConfigModifier.default_config(),
                             GradientAccumulationModifier.default_config().set(grad_acc_steps=4),
                         ],
                     ),
@@ -496,12 +511,45 @@ def get_trainer_kwargs(
                     "gpu-(p5.48xlarge|p4de.24xlarge)-(512|1024)",
                     mesh_shape_from_axes(data=-1, fsdp=128),
                 ),
+                (
+                    "neuron-(trn2|trn2n).48xlarge-64",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(fsdp=-1, model=4)
+                            ),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=True,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved="|".join(
+                                                [
+                                                    RematRegexSavePatterns.QKV_PROJ.value,
+                                                    RematRegexSavePatterns.LINEAR1_X.value,
+                                                ]
+                                            ),
+                                            names_which_can_be_offloaded=None,
+                                            offload_src=None,
+                                            offload_dst=None,
+                                        ),
+                                    ),
+                                }
+                            ),
+                        ],
+                    ),
+                ),
             ),
         )
     else:
         raise NotImplementedError(f"Unknown model size {model_size}.")
     model_kwargs = trainer_kwargs.pop("model_kwargs")
     model_kwargs.setdefault("vocab_size", vocab_size)
+    if version == Version.V3_TIKTOKEN:  # tiktoken tokenizer
+        model_kwargs["pad_token_id"] = 128004
+        model_kwargs["eos_token_id"] = 128001
     trainer_kwargs["model_cfg"] = model_config(**model_kwargs)
     trainer_kwargs["learner_cfg"] = adamw_decoupled_learner_config(
         max_step=trainer_kwargs["max_step"],
@@ -524,6 +572,8 @@ def model_config(
     ffn_dim: Optional[Union[int, config.FunctionConfigBase]] = None,
     flash_attention: bool = False,
     stack_cfg: Optional[BaseStackedTransformerLayer.Config] = None,
+    pad_token_id: Optional[int] = None,
+    eos_token_id: Optional[int] = None,
 ) -> causal_lm.Model.Config:
     """Returns an LM model config based on the given hyperparams.
 
@@ -542,6 +592,8 @@ def model_config(
         flash_attention: Whether to enable flash attention.
         stack_cfg: The transformer stack config.
             If None, defaults to a RepeatedTransformerLayer.
+        pad_token_id: Int ID of the inputs to be masked for self-attention.
+        eos_token_id: Int ID of the end of sequence token id.
 
     Returns:
         A causal LM config.
@@ -579,6 +631,8 @@ def model_config(
         lm_head_cfg=LmHead.default_config() if not shared_lm_head else None,
         attention_cfg=flash_attention_config() if flash_attention else atten_cfg,
         attention_qkv_linear=atten_qkv_linear,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
     )
     return cfg
 
@@ -597,6 +651,8 @@ def trainer_configs(
     for version, model_size, flash_attention in itertools.product(
         Version, MODEL_SIZES, [True, False]
     ):
+        if model_size not in TOTAL_TOKENS[version]:  # This combination does not exist.
+            continue
         vocab_size = VOCAB_SIZE[version]
         config_name = make_config_name(
             arch=arch,
@@ -607,8 +663,6 @@ def trainer_configs(
         kwargs = get_trainer_kwargs(
             model_size, vocab_size=vocab_size, version=version, flash_attention=flash_attention
         )
-        if len(kwargs) == 0:  # This combination does not exist
-            continue
         max_sequence_length = kwargs.pop("max_sequence_length")
         # pylint: disable-next=unexpected-keyword-arg,missing-kwoa
         config_map[config_name] = get_trainer_config_fn(
@@ -662,9 +716,13 @@ def trainer_configs(
 
                 # The original config was supposed to run on >= 32 machines.
                 # pylint: disable=cell-var-from-loop
-                cfg.input.batcher.global_batch_size //= 128 if version == Version.V3 else 32
+                cfg.input.input_dispatcher.global_logical_batch_size //= (
+                    128 if version in (Version.V3, Version.V3_TIKTOKEN) else 32
+                )
                 for evaler in cfg.evalers.values():
-                    evaler.input.batcher.global_batch_size //= 128 if version == Version.V3 else 32
+                    evaler.input.input_dispatcher.global_logical_batch_size //= (
+                        128 if version in (Version.V3, Version.V3_TIKTOKEN) else 32
+                    )
                 # pylint: enable=cell-var-from-loop
                 return cfg
 
