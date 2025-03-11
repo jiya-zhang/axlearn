@@ -58,6 +58,10 @@ from axlearn.experiments.text.gpt.common import model_config as common_model_con
 from axlearn.experiments.text.gpt.common import scaled_hidden_dim
 from axlearn.experiments.trainer_config_utils import TrainerConfigFn, V6eFlashConfigModifier
 
+from absl import flags
+
+FLAGS = flags.FLAGS
+
 MODEL_SIZES = ("test", "1B", "3B", "7B", "8B", "70B")
 
 
