@@ -228,6 +228,10 @@ def get_trainer_kwargs(
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
         )
     elif model_size == "7B":
+        if FLAGS.pdbs:
+            import jax
+            train_batch_size = len(jax.devices()) * int(FLAGS.pdbs)
+
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=32,
@@ -443,7 +447,7 @@ def get_trainer_kwargs(
             learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
             train_batch_size=train_batch_size,
-            max_step=100,
+            max_step=max_step,
             mesh_shape=mesh_shape_from_axes(fsdp=-1),
             mesh_rules=(
                 # TPU V5e maximum per device batch is 1.

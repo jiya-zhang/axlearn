@@ -910,7 +910,7 @@ class TPUGKEJob(GKEJob):
 
         if job_type == "pathways-head":
             # Target a specific CPU nodepool for Pathways containers
-            selector.update({"node.kubernetes.io/instance-type": "n2d-standard-32"})
+            selector.update({"node.kubernetes.io/instance-type": "n2-standard-32"})
             initContainers.extend(self._build_pathways_containers())
         else:
             selector.update(
