@@ -592,7 +592,7 @@ class SpmdTrainer(Module):
                         self.summary_writer(self.step, {"average_step_time": average_step_time})
                         num_steps = 0
                         start_time = now
-                    if self.step >= cfg.max_step:
+                    if self.step >= 500:
                         self._step_log("Reached max_step=%s. Stopping", cfg.max_step)
                         break
                 if self.step < cfg.max_step:
@@ -1256,7 +1256,7 @@ class SpmdTrainer(Module):
         if should_start_tracing:
             self._step_log("Start profiler tracing")
             jax.profiler.start_trace(self.summary_writer.config.dir)
-            updated_stop_trace_step = self.step + 3
+            updated_stop_trace_step = self.step + 10
         return updated_stop_trace_step
 
 
