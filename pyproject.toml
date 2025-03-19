@@ -24,8 +24,8 @@ core = [
     "chex==0.1.88",
     "einops==0.8.0",
     "importlab==0.8.1",  # breaks pytype on 0.8
-    "jax==0.4.37",
-    "jaxlib==0.4.36",  # jax 0.4.37 is patch release, no corresponding jaxlib release
+    "jax==0.5.1",
+    "jaxlib==0.5.1",  # jax 0.4.37 is patch release, no corresponding jaxlib release
     "ml-dtypes==0.4.1",
     "nltk==3.7",  # for text preprocessing
     "optax==0.1.7",  # optimizers (0.1.0 has known bugs).
@@ -106,7 +106,7 @@ gcp = [
 # Note: Specify -f https://storage.googleapis.com/jax-releases/libtpu_releases.html during install.
 tpu = [
     "axlearn[gcp]",
-    "jax[tpu]==0.4.37",  # must be >=0.4.19 for compat with v5p.
+    "jax[tpu]==0.5.1",  # must be >=0.4.19 for compat with v5p.
 ]
 # Vertex AI tensorboard. TODO(markblee): Merge with `gcp`.
 vertexai_tensorboard = [
