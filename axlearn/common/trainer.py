@@ -1256,7 +1256,7 @@ class SpmdTrainer(Module):
         if should_start_tracing:
             self._step_log("Start profiler tracing")
             jax.profiler.start_trace(self.summary_writer.config.dir)
-            updated_stop_trace_step = self.step + 10
+            updated_stop_trace_step = self.step + 5
         return updated_stop_trace_step
 
 
