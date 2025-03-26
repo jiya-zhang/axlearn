@@ -611,7 +611,7 @@ class TPUReplicatedJob(SingleReplicatedJob):
                     # the original jobset attempts to restart (node pool conflict). This is more
                     # reliable at the moment but doesn't take advantage of node pool sharing. GCP is
                     # working on a fix.
-                    "provisioner-nodepool-id": cfg.name,
+                    # "provisioner-nodepool-id": cfg.name,
                 }
             )
 
